@@ -207,6 +207,12 @@ llm-subtrans --list-formats
 
 # Batch process files in a folder tree (activate the virtual environment first)
 python scripts/batch_translate.py ./subtitles ./translated --provider openai --model gpt-5-mini --apikey sk-... --language Spanish
+
+# Experimental VTuber pipeline (YouTube URL -> Chinese SRT)
+python scripts/vtuber_subtitler.py "https://www.youtube.com/watch?v=<VIDEO_ID>" \
+  --output ./output/demo.zh.srt \
+  --asr-api-key "$GROQ_API_KEY" \
+  --llm-api-key "$DEEPSEEK_API_KEY"
 ```
 
 The output format is inferred from file extensions. To convert between formats, provide an output path with the desired extension.

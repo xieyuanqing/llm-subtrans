@@ -1,0 +1,916 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import pathlib
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import requests
+
+from scripts.subtrans_common import InitLogger
+
+
+class VTuberSubtitlerError(Exception):
+    """Raised when the VTuber subtitling pipeline fails."""
+
+
+@dataclass
+class AudioChunk:
+    """Description of a chunked audio file."""
+    index: int
+    path: pathlib.Path
+    source_start: float
+    source_end: float
+    keep_start: float
+    keep_end: float
+
+
+@dataclass
+class Segment:
+    """A subtitle segment with time range and text."""
+    id: int
+    start: float
+    end: float
+    text: str
+    source_ids: list[int] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize segment to dictionary."""
+        return {
+            "id": self.id,
+            "start": round(self.start, 3),
+            "end": round(self.end, 3),
+            "text": self.text,
+            "source_ids": self.source_ids,
+        }
+
+
+@dataclass
+class PipelineConfig:
+    """Runtime configuration for the two-pass subtitler."""
+    url: str
+    output: pathlib.Path
+    workspace: pathlib.Path
+    asr_api_base: str
+    asr_api_key: str
+    asr_model: str
+    llm_api_base: str
+    llm_api_key: str
+    llm_model: str
+    max_chunk_mb: float = 5.0
+    overlap_seconds: float = 0.5
+    min_chunk_seconds: float = 90.0
+    pass1_batch_size: int = 120
+    pass2_batch_size: int = 24
+    pass2_context_lines: int = 5
+    request_timeout: float = 180.0
+    retry_count: int = 3
+    retry_backoff_seconds: float = 1.8
+    glossary_path: pathlib.Path|None = None
+    title_override: str|None = None
+    description_override: str|None = None
+    channel_override: str|None = None
+
+
+class OpenAICompatClient:
+    """Thin client for OpenAI-compatible ASR and chat endpoints."""
+
+    def __init__(
+        self,
+        api_base: str,
+        api_key: str,
+        timeout: float,
+        retries: int,
+        backoff_seconds: float,
+    ):
+        self.api_base = api_base.rstrip('/')
+        self.api_key = api_key
+        self.timeout = timeout
+        self.retries = retries
+        self.backoff_seconds = backoff_seconds
+
+    def transcribe_audio(
+        self,
+        file_path: pathlib.Path,
+        model: str,
+        prompt: str|None,
+    ) -> list[dict[str, Any]]:
+        """Call /audio/transcriptions and return segment dictionaries."""
+        url = f"{self.api_base}/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        payload = {
+            "model": model,
+            "response_format": "verbose_json",
+            "language": "ja",
+            "timestamp_granularities[]": "segment",
+        }
+        if prompt:
+            payload["prompt"] = prompt
+
+        for attempt in range(1, self.retries + 1):
+            with open(file_path, 'rb') as audio_file:
+                files = {
+                    "file": (file_path.name, audio_file, "audio/m4a"),
+                }
+                try:
+                    response = requests.post(
+                        url,
+                        headers=headers,
+                        data=payload,
+                        files=files,
+                        timeout=self.timeout,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    segments = data.get("segments")
+                    if isinstance(segments, list):
+                        return [segment for segment in segments if isinstance(segment, dict)]
+
+                    text = str(data.get("text") or "").strip()
+                    if text:
+                        return [{"start": 0.0, "end": 0.0, "text": text}]
+
+                    return []
+                except (requests.RequestException, ValueError) as error:
+                    if attempt >= self.retries:
+                        raise VTuberSubtitlerError(f"ASR request failed: {error}") from error
+                    sleep_seconds = self.backoff_seconds ** attempt
+                    logging.warning("ASR request failed, retrying in %.1fs (%s)", sleep_seconds, error)
+                    time.sleep(sleep_seconds)
+
+        return []
+
+    def chat_json(
+        self,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+    ) -> Any:
+        """Call /chat/completions and parse JSON content from model output."""
+        url = f"{self.api_base}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "temperature": temperature,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+
+        for attempt in range(1, self.retries + 1):
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                data = response.json()
+                choices = data.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    raise VTuberSubtitlerError("LLM response did not include choices")
+
+                message = choices[0].get("message") if isinstance(choices[0], dict) else None
+                content = message.get("content") if isinstance(message, dict) else None
+                if not isinstance(content, str) or not content.strip():
+                    raise VTuberSubtitlerError("LLM response had empty content")
+
+                return ParseJsonFromText(content)
+            except (requests.RequestException, ValueError, VTuberSubtitlerError) as error:
+                if attempt >= self.retries:
+                    raise VTuberSubtitlerError(f"LLM request failed: {error}") from error
+                sleep_seconds = self.backoff_seconds ** attempt
+                logging.warning("LLM request failed, retrying in %.1fs (%s)", sleep_seconds, error)
+                time.sleep(sleep_seconds)
+
+        raise VTuberSubtitlerError("LLM request failed after retries")
+
+
+class VTuberSubtitler:
+    """End-to-end implementation of the two-pass VTuber subtitle pipeline."""
+
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.asr_client = OpenAICompatClient(
+            api_base=config.asr_api_base,
+            api_key=config.asr_api_key,
+            timeout=config.request_timeout,
+            retries=config.retry_count,
+            backoff_seconds=config.retry_backoff_seconds,
+        )
+        self.llm_client = OpenAICompatClient(
+            api_base=config.llm_api_base,
+            api_key=config.llm_api_key,
+            timeout=config.request_timeout,
+            retries=config.retry_count,
+            backoff_seconds=config.retry_backoff_seconds,
+        )
+
+    def run(self) -> pathlib.Path:
+        """Execute all stages and return output SRT path."""
+        EnsureBinaryInstalled("yt-dlp")
+        EnsureBinaryInstalled("ffmpeg")
+        EnsureBinaryInstalled("ffprobe")
+
+        self.config.workspace.mkdir(parents=True, exist_ok=True)
+
+        logging.info("Phase 1/5: download audio and metadata")
+        audio_path, metadata = self.download_audio_and_metadata()
+        self.write_json(self.config.workspace / "metadata.json", metadata)
+
+        logging.info("Phase 1/5: split audio into safe chunks")
+        chunks = self.split_audio(audio_path)
+        if not chunks:
+            raise VTuberSubtitlerError("No audio chunks were generated")
+
+        logging.info("Phase 2/5: ASR transcription (%d chunks)", len(chunks))
+        raw_segments = self.transcribe_chunks(chunks, metadata)
+        if not raw_segments:
+            raise VTuberSubtitlerError("ASR returned no subtitle segments")
+        self.write_json(self.config.workspace / "raw_asr.json", [s.to_dict() for s in raw_segments])
+
+        logging.info("Phase 3/5: semantic reorganization pass")
+        merged = self.semantic_reorganize(raw_segments)
+        if not merged:
+            raise VTuberSubtitlerError("Pass-1 did not return any merged segments")
+        self.write_json(self.config.workspace / "pass1_merged.json", [s.to_dict() for s in merged])
+
+        logging.info("Phase 4/5: contextual translation pass")
+        translated = self.contextual_translate(merged, metadata)
+        if not translated:
+            raise VTuberSubtitlerError("Pass-2 did not return translated segments")
+        self.write_json(self.config.workspace / "pass2_translated.json", [s.to_dict() for s in translated])
+
+        logging.info("Phase 5/5: build SRT output")
+        self.config.output.parent.mkdir(parents=True, exist_ok=True)
+        self.config.output.write_text(BuildSrtText(translated), encoding="utf-8")
+
+        logging.info("Pipeline completed: %s", self.config.output)
+        return self.config.output
+
+    def download_audio_and_metadata(self) -> tuple[pathlib.Path, dict[str, Any]]:
+        """Download source audio with yt-dlp and capture metadata."""
+        metadata_command = [
+            "yt-dlp",
+            "--no-playlist",
+            "--dump-single-json",
+            self.config.url,
+        ]
+        metadata_result = subprocess.run(
+            metadata_command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if metadata_result.returncode != 0:
+            raise VTuberSubtitlerError(
+                f"Failed to fetch metadata via yt-dlp: {metadata_result.stderr.strip()}"
+            )
+
+        try:
+            metadata = json.loads(metadata_result.stdout)
+        except json.JSONDecodeError as error:
+            raise VTuberSubtitlerError("yt-dlp metadata output was not valid JSON") from error
+
+        output_template = self.config.workspace / "source.%(ext)s"
+        download_command = [
+            "yt-dlp",
+            "--no-playlist",
+            "-f",
+            "ba",
+            "-x",
+            "--audio-format",
+            "m4a",
+            "--audio-quality",
+            "0",
+            "-o",
+            str(output_template),
+            "--print",
+            "after_move:filepath",
+            self.config.url,
+        ]
+
+        download_result = subprocess.run(
+            download_command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if download_result.returncode != 0:
+            raise VTuberSubtitlerError(
+                f"Failed to download audio via yt-dlp: {download_result.stderr.strip()}"
+            )
+
+        path_lines = [line.strip() for line in download_result.stdout.splitlines() if line.strip()]
+        if not path_lines:
+            raise VTuberSubtitlerError("yt-dlp did not output downloaded file path")
+
+        audio_path = pathlib.Path(path_lines[-1]).resolve()
+        if not audio_path.exists():
+            raise VTuberSubtitlerError(f"Downloaded audio file not found: {audio_path}")
+
+        return audio_path, {
+            "title": self.config.title_override or str(metadata.get("title") or ""),
+            "description": self.config.description_override or str(metadata.get("description") or ""),
+            "channel": self.config.channel_override or str(metadata.get("uploader") or ""),
+            "webpage_url": str(metadata.get("webpage_url") or self.config.url),
+        }
+
+    def split_audio(self, source_audio: pathlib.Path) -> list[AudioChunk]:
+        """Split source audio into chunks below max chunk size."""
+        max_bytes = int(self.config.max_chunk_mb * 1024 * 1024)
+        source_size = source_audio.stat().st_size
+        total_duration = ProbeDuration(source_audio)
+
+        if total_duration <= 0:
+            raise VTuberSubtitlerError("Could not determine audio duration")
+
+        if source_size <= max_bytes:
+            return [
+                AudioChunk(
+                    index=1,
+                    path=source_audio,
+                    source_start=0.0,
+                    source_end=total_duration,
+                    keep_start=0.0,
+                    keep_end=total_duration,
+                )
+            ]
+
+        bytes_per_second = source_size / total_duration
+        chunk_duration = max(
+            self.config.min_chunk_seconds,
+            math.floor((max_bytes / max(bytes_per_second, 1.0)) * 0.9),
+        )
+
+        chunks_dir = self.config.workspace / "chunks"
+        if chunks_dir.exists():
+            shutil.rmtree(chunks_dir)
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+
+        chunks: list[AudioChunk] = []
+        cursor = 0.0
+        index = 1
+
+        while cursor < total_duration:
+            keep_start = cursor
+            keep_end = min(total_duration, cursor + chunk_duration)
+            source_start = max(0.0, keep_start - self.config.overlap_seconds)
+            source_end = min(total_duration, keep_end + self.config.overlap_seconds)
+
+            chunk_path = chunks_dir / f"chunk_{index:04d}.m4a"
+            self.extract_audio_slice(source_audio, chunk_path, source_start, source_end)
+
+            if chunk_path.stat().st_size > max_bytes:
+                self.extract_audio_slice(
+                    source_audio,
+                    chunk_path,
+                    source_start,
+                    source_end,
+                    reencode=True,
+                )
+
+            if chunk_path.stat().st_size > max_bytes:
+                raise VTuberSubtitlerError(
+                    f"Chunk {chunk_path.name} exceeded {self.config.max_chunk_mb}MB even after reencode"
+                )
+
+            chunks.append(
+                AudioChunk(
+                    index=index,
+                    path=chunk_path,
+                    source_start=source_start,
+                    source_end=source_end,
+                    keep_start=keep_start,
+                    keep_end=keep_end,
+                )
+            )
+
+            if keep_end >= total_duration:
+                break
+
+            cursor = keep_end
+            index += 1
+
+        return chunks
+
+    def extract_audio_slice(
+        self,
+        source_audio: pathlib.Path,
+        destination: pathlib.Path,
+        start_seconds: float,
+        end_seconds: float,
+        reencode: bool = False,
+    ) -> None:
+        """Extract one audio slice via ffmpeg."""
+        command = [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-ss",
+            f"{max(start_seconds, 0.0):.3f}",
+            "-to",
+            f"{max(end_seconds, 0.0):.3f}",
+            "-i",
+            str(source_audio),
+            "-vn",
+        ]
+
+        if reencode:
+            command.extend(["-ac", "1", "-ar", "16000", "-b:a", "64k", "-c:a", "aac"])
+        else:
+            command.extend(["-c", "copy"])
+
+        command.append(str(destination))
+
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise VTuberSubtitlerError(f"ffmpeg slice extraction failed: {result.stderr.strip()}")
+
+        if not destination.exists() or destination.stat().st_size == 0:
+            raise VTuberSubtitlerError(f"ffmpeg produced empty chunk: {destination}")
+
+    def transcribe_chunks(
+        self,
+        chunks: list[AudioChunk],
+        metadata: dict[str, Any],
+    ) -> list[Segment]:
+        """Run ASR for each chunk and map local timestamps back to source timeline."""
+        initial_prompt = BuildAsrPrompt(metadata)
+        global_segments: list[Segment] = []
+        next_id = 1
+
+        for chunk in chunks:
+            logging.info("ASR chunk %d/%d: %s", chunk.index, len(chunks), chunk.path.name)
+            local_segments = self.asr_client.transcribe_audio(
+                file_path=chunk.path,
+                model=self.config.asr_model,
+                prompt=initial_prompt,
+            )
+
+            for item in local_segments:
+                local_start = float(item.get("start") or 0.0)
+                local_end = float(item.get("end") or local_start)
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+
+                absolute_start = chunk.source_start + max(local_start, 0.0)
+                absolute_end = chunk.source_start + max(local_end, local_start)
+
+                midpoint = (absolute_start + absolute_end) / 2
+                if midpoint < chunk.keep_start or midpoint > chunk.keep_end:
+                    continue
+
+                global_segments.append(
+                    Segment(
+                        id=next_id,
+                        start=round(max(0.0, absolute_start), 3),
+                        end=round(max(absolute_end, absolute_start), 3),
+                        text=text,
+                    )
+                )
+                next_id += 1
+
+        if not global_segments:
+            return []
+
+        global_segments.sort(key=lambda segment: (segment.start, segment.end, segment.id))
+        return global_segments
+
+    def semantic_reorganize(self, raw_segments: list[Segment]) -> list[Segment]:
+        """Pass-1: merge fragmented ASR output into coherent Japanese sentences."""
+        merged: list[Segment] = []
+        id_lookup = {segment.id: segment for segment in raw_segments}
+        next_id = 1
+
+        for batch in ChunkList(raw_segments, self.config.pass1_batch_size):
+            payload = [
+                {
+                    "id": segment.id,
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text,
+                }
+                for segment in batch
+            ]
+
+            system_prompt = (
+                "You are a strict subtitle editor for Japanese speech transcription. "
+                "Your task is to merge fragmented ASR pieces into grammatical Japanese sentences "
+                "without changing factual meaning. Remove meaningless filler words only when safe. "
+                "Return JSON ONLY."
+            )
+            user_prompt = (
+                "Input JSON array (chronological ASR fragments):\n"
+                f"{json.dumps(payload, ensure_ascii=False)}\n\n"
+                "Output requirements:\n"
+                "1) Output a JSON array named items or a root JSON array.\n"
+                "2) Each item must contain: source_ids (array[int]), start, end, text.\n"
+                "3) start MUST equal first source id start. end MUST equal last source id end.\n"
+                "4) Preserve chronological order.\n"
+                "5) Do not output markdown fences or explanations."
+            )
+
+            response_json = self.llm_client.chat_json(
+                model=self.config.llm_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.0,
+            )
+
+            parsed_items = NormalizeArrayPayload(response_json)
+            for item in parsed_items:
+                source_ids = ParseSourceIds(item.get("source_ids"), list(id_lookup.keys()))
+                if not source_ids:
+                    continue
+
+                source_segments = [id_lookup[source_id] for source_id in source_ids if source_id in id_lookup]
+                if not source_segments:
+                    continue
+
+                source_segments.sort(key=lambda segment: (segment.start, segment.end, segment.id))
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+
+                merged.append(
+                    Segment(
+                        id=next_id,
+                        start=source_segments[0].start,
+                        end=source_segments[-1].end,
+                        text=text,
+                        source_ids=[segment.id for segment in source_segments],
+                    )
+                )
+                next_id += 1
+
+        merged.sort(key=lambda segment: (segment.start, segment.end, segment.id))
+        return merged
+
+    def contextual_translate(
+        self,
+        merged_segments: list[Segment],
+        metadata: dict[str, Any],
+    ) -> list[Segment]:
+        """Pass-2: translate cleaned Japanese lines to Chinese with sliding context."""
+        glossary_text = ""
+        if self.config.glossary_path and self.config.glossary_path.exists():
+            glossary_text = self.config.glossary_path.read_text(encoding="utf-8").strip()
+
+        translated: list[Segment] = []
+
+        for offset in range(0, len(merged_segments), self.config.pass2_batch_size):
+            batch = merged_segments[offset:offset + self.config.pass2_batch_size]
+            context_start = max(0, offset - self.config.pass2_context_lines)
+            context_lines = merged_segments[context_start:offset]
+
+            system_prompt = BuildPass2SystemPrompt(metadata, glossary_text)
+            user_prompt = (
+                "Context lines (for reference only, DO NOT translate these into output):\n"
+                f"{json.dumps([line.to_dict() for line in context_lines], ensure_ascii=False)}\n\n"
+                "Target lines (translate these only):\n"
+                f"{json.dumps([line.to_dict() for line in batch], ensure_ascii=False)}\n\n"
+                "Return JSON array matching target length exactly. "
+                "Keep id/start/end unchanged and replace text with fluent Simplified Chinese only."
+            )
+
+            response_json = self.llm_client.chat_json(
+                model=self.config.llm_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.0,
+            )
+
+            output_items = NormalizeArrayPayload(response_json)
+            normalized = self.normalize_pass2_output(batch, output_items)
+            translated.extend(normalized)
+
+        translated.sort(key=lambda segment: (segment.start, segment.end, segment.id))
+        return translated
+
+    def normalize_pass2_output(self, expected_batch: list[Segment], output_items: list[dict[str, Any]]) -> list[Segment]:
+        """Validate pass-2 output against expected IDs and lengths."""
+        if not output_items:
+            raise VTuberSubtitlerError("Pass-2 returned empty output for a non-empty batch")
+
+        expected_by_id = {segment.id: segment for segment in expected_batch}
+        translated: list[Segment] = []
+
+        for item in output_items:
+            item_id = SafeInt(item.get("id"))
+            if item_id is None or item_id not in expected_by_id:
+                continue
+
+            expected = expected_by_id[item_id]
+            text = str(item.get("text") or "").strip()
+            if not text:
+                text = expected.text
+
+            translated.append(
+                Segment(
+                    id=expected.id,
+                    start=expected.start,
+                    end=expected.end,
+                    text=text,
+                    source_ids=list(expected.source_ids),
+                )
+            )
+
+        if len(translated) != len(expected_batch):
+            missing_ids = [segment.id for segment in expected_batch if segment.id not in {item.id for item in translated}]
+            raise VTuberSubtitlerError(
+                "Pass-2 output did not preserve required id mapping, missing ids: "
+                f"{missing_ids}"
+            )
+
+        translated.sort(key=lambda segment: segment.id)
+        return translated
+
+    def write_json(self, output_path: pathlib.Path, payload: Any) -> None:
+        """Write pretty UTF-8 JSON to file."""
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def EnsureBinaryInstalled(binary: str) -> None:
+    """Fail fast if a required command is not available."""
+    if shutil.which(binary):
+        return
+    raise VTuberSubtitlerError(f"Required binary is not installed or not in PATH: {binary}")
+
+
+def ProbeDuration(audio_path: pathlib.Path) -> float:
+    """Return duration (seconds) using ffprobe."""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise VTuberSubtitlerError(f"ffprobe failed: {result.stderr.strip()}")
+
+    value = result.stdout.strip()
+    try:
+        return float(value)
+    except ValueError as error:
+        raise VTuberSubtitlerError(f"Invalid duration from ffprobe: {value}") from error
+
+
+def BuildAsrPrompt(metadata: dict[str, Any]) -> str:
+    """Compose initial ASR prompt from title/channel metadata."""
+    title = str(metadata.get("title") or "").strip()
+    channel = str(metadata.get("channel") or "").strip()
+    if not title and not channel:
+        return ""
+    return f"Video title: {title}; Channel: {channel}; Please preserve named entities correctly."
+
+
+def BuildPass2SystemPrompt(metadata: dict[str, Any], glossary_text: str) -> str:
+    """Create pass-2 translation system prompt."""
+    title = str(metadata.get("title") or "").strip()
+    description = str(metadata.get("description") or "").strip()
+    channel = str(metadata.get("channel") or "").strip()
+
+    sections = [
+        "You are an expert JP->ZH subtitle translator for VTuber content.",
+        "Translate Japanese into natural Simplified Chinese.",
+        "Do not summarize, do not omit meaning, and keep line-level alignment by id.",
+        "Keep internet slang, game jargon, and VTuber catchphrases consistent.",
+    ]
+
+    if title:
+        sections.append(f"Video title context: {title}")
+    if channel:
+        sections.append(f"Channel context: {channel}")
+    if description:
+        sections.append(f"Video description context: {description[:2000]}")
+    if glossary_text:
+        sections.append(f"Glossary to prioritize:\n{glossary_text[:3000]}")
+
+    sections.append("Return valid JSON only, no markdown and no extra commentary.")
+    return "\n".join(sections)
+
+
+def ParseJsonFromText(text: str) -> Any:
+    """Parse JSON that may be wrapped in markdown fences."""
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("Empty text cannot be parsed as JSON")
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    if "```" in stripped:
+        pieces = stripped.split("```")
+        for piece in pieces:
+            candidate = piece.strip()
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:].strip()
+            if not candidate:
+                continue
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
+    start = min((index for index in [stripped.find("["), stripped.find("{")] if index != -1), default=-1)
+    if start == -1:
+        raise ValueError("No JSON object or array found in response")
+
+    candidate = stripped[start:]
+    for end in range(len(candidate), 0, -1):
+        snippet = candidate[:end]
+        try:
+            return json.loads(snippet)
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("Unable to parse JSON from response text")
+
+
+def NormalizeArrayPayload(payload: Any) -> list[dict[str, Any]]:
+    """Accept root array or object with `items` and normalize to list of dict."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    if isinstance(payload, dict):
+        items = payload.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+
+    return []
+
+
+def ParseSourceIds(value: Any, valid_ids: list[int]) -> list[int]:
+    """Normalize source_ids field into sorted unique ids."""
+    id_set = set(valid_ids)
+    normalized: list[int] = []
+
+    if isinstance(value, list):
+        for item in value:
+            parsed = SafeInt(item)
+            if parsed is not None and parsed in id_set:
+                normalized.append(parsed)
+    else:
+        parsed = SafeInt(value)
+        if parsed is not None and parsed in id_set:
+            normalized.append(parsed)
+
+    deduped = sorted(set(normalized))
+    return deduped
+
+
+def SafeInt(value: Any) -> int|None:
+    """Best-effort int conversion."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def ChunkList(items: list[Any], size: int) -> list[list[Any]]:
+    """Split list into fixed-size chunks."""
+    if size <= 0:
+        raise ValueError("Chunk size must be positive")
+    return [items[index:index + size] for index in range(0, len(items), size)]
+
+
+def FormatSrtTimestamp(seconds: float) -> str:
+    """Convert float seconds to SRT HH:MM:SS,mmm format."""
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def BuildSrtText(segments: list[Segment]) -> str:
+    """Render subtitle segments to SRT text."""
+    lines: list[str] = []
+    for index, segment in enumerate(sorted(segments, key=lambda s: (s.start, s.end, s.id)), start=1):
+        lines.append(str(index))
+        lines.append(f"{FormatSrtTimestamp(segment.start)} --> {FormatSrtTimestamp(segment.end)}")
+        lines.append(segment.text.strip())
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def BuildArgParser() -> argparse.ArgumentParser:
+    """Build CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        description="Two-pass VTuber subtitle pipeline (YouTube URL -> Chinese SRT)"
+    )
+    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument("-o", "--output", required=True, help="Output SRT path")
+    parser.add_argument(
+        "--workspace",
+        default="./workspace/vtuber_subtitler",
+        help="Workspace directory for downloaded audio and intermediate JSON",
+    )
+
+    parser.add_argument("--asr-api-base", default=os.getenv("ASR_API_BASE", "https://api.groq.com/openai/v1"))
+    parser.add_argument("--asr-api-key", default=os.getenv("ASR_API_KEY") or os.getenv("GROQ_API_KEY") or "")
+    parser.add_argument("--asr-model", default=os.getenv("ASR_MODEL", "whisper-large-v3-turbo"))
+
+    parser.add_argument("--llm-api-base", default=os.getenv("LLM_API_BASE", "https://api.deepseek.com/v1"))
+    parser.add_argument("--llm-api-key", default=os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "")
+    parser.add_argument("--llm-model", default=os.getenv("LLM_MODEL", "deepseek-chat"))
+
+    parser.add_argument("--max-chunk-mb", type=float, default=5.0)
+    parser.add_argument("--overlap-seconds", type=float, default=0.5)
+    parser.add_argument("--min-chunk-seconds", type=float, default=90.0)
+    parser.add_argument("--pass1-batch-size", type=int, default=120)
+    parser.add_argument("--pass2-batch-size", type=int, default=24)
+    parser.add_argument("--pass2-context-lines", type=int, default=5)
+    parser.add_argument("--request-timeout", type=float, default=180.0)
+    parser.add_argument("--retry-count", type=int, default=3)
+    parser.add_argument("--retry-backoff-seconds", type=float, default=1.8)
+
+    parser.add_argument("--glossary", help="Path to glossary text file")
+    parser.add_argument("--title", help="Override title metadata")
+    parser.add_argument("--description", help="Override description metadata")
+    parser.add_argument("--channel", help="Override channel metadata")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+
+    return parser
+
+
+def BuildConfigFromArgs(args: argparse.Namespace) -> PipelineConfig:
+    """Create PipelineConfig from parsed args."""
+    asr_key = str(args.asr_api_key or "").strip()
+    llm_key = str(args.llm_api_key or "").strip()
+
+    if not asr_key:
+        raise VTuberSubtitlerError("ASR API key is required (--asr-api-key or ASR_API_KEY/GROQ_API_KEY)")
+    if not llm_key:
+        raise VTuberSubtitlerError("LLM API key is required (--llm-api-key or LLM_API_KEY/DEEPSEEK_API_KEY)")
+
+    return PipelineConfig(
+        url=args.url,
+        output=pathlib.Path(args.output).expanduser().resolve(),
+        workspace=pathlib.Path(args.workspace).expanduser().resolve(),
+        asr_api_base=str(args.asr_api_base),
+        asr_api_key=asr_key,
+        asr_model=str(args.asr_model),
+        llm_api_base=str(args.llm_api_base),
+        llm_api_key=llm_key,
+        llm_model=str(args.llm_model),
+        max_chunk_mb=float(args.max_chunk_mb),
+        overlap_seconds=float(args.overlap_seconds),
+        min_chunk_seconds=float(args.min_chunk_seconds),
+        pass1_batch_size=int(args.pass1_batch_size),
+        pass2_batch_size=int(args.pass2_batch_size),
+        pass2_context_lines=int(args.pass2_context_lines),
+        request_timeout=float(args.request_timeout),
+        retry_count=int(args.retry_count),
+        retry_backoff_seconds=float(args.retry_backoff_seconds),
+        glossary_path=pathlib.Path(args.glossary).expanduser().resolve() if args.glossary else None,
+        title_override=args.title,
+        description_override=args.description,
+        channel_override=args.channel,
+    )
+
+
+def main() -> int:
+    """CLI entrypoint."""
+    parser = BuildArgParser()
+    args = parser.parse_args()
+
+    InitLogger("vtuber-subtitler", args.debug)
+
+    try:
+        config = BuildConfigFromArgs(args)
+        pipeline = VTuberSubtitler(config)
+        output_path = pipeline.run()
+        logging.info("Wrote subtitle file: %s", output_path)
+        return 0
+    except VTuberSubtitlerError as error:
+        logging.error("Pipeline failed: %s", error)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
