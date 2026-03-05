@@ -16,18 +16,38 @@ Script: `scripts/vtuber_subtitler.py`
 - Python environment from this project
 - `yt-dlp` binary in PATH
 - `ffmpeg` + `ffprobe` binaries in PATH
-- ASR endpoint compatible with `/audio/transcriptions`
+- Local ASR mode: OpenAI-compatible Whisper endpoint (`/audio/transcriptions`)
+- Cloudflare ASR mode: Workers AI account + API token
 - LLM endpoint compatible with `/chat/completions`
 
 ## Quick Start
+
+### A) Local 4060 Whisper (manual mode)
 
 ```bash
 python scripts/vtuber_subtitler.py \
   "https://www.youtube.com/watch?v=<VIDEO_ID>" \
   --output ./output/demo.zh.srt \
-  --asr-api-base https://api.groq.com/openai/v1 \
-  --asr-api-key "$GROQ_API_KEY" \
-  --asr-model whisper-large-v3-turbo \
+  --asr-provider local \
+  --local-asr-api-base "http://<WINDOWS_HOST>:8000/v1" \
+  --local-asr-model whisper-large-v3 \
+  --llm-api-base https://api.deepseek.com/v1 \
+  --llm-api-key "$DEEPSEEK_API_KEY" \
+  --llm-model deepseek-chat \
+  --terminology-lock warn \
+  --strict-json
+```
+
+### B) Cloudflare Whisper (manual mode)
+
+```bash
+python scripts/vtuber_subtitler.py \
+  "https://www.youtube.com/watch?v=<VIDEO_ID>" \
+  --output ./output/demo.zh.srt \
+  --asr-provider cloudflare \
+  --cloudflare-account-id "$CLOUDFLARE_ACCOUNT_ID" \
+  --cloudflare-api-token "$CLOUDFLARE_API_TOKEN" \
+  --cloudflare-asr-model "@cf/openai/whisper-large-v3-turbo" \
   --llm-api-base https://api.deepseek.com/v1 \
   --llm-api-key "$DEEPSEEK_API_KEY" \
   --llm-model deepseek-chat \
@@ -44,6 +64,8 @@ Intermediates are written to `./workspace/vtuber_subtitler` by default:
 
 ## Notes
 
+- ASR provider is manual: choose `--asr-provider local` or `--asr-provider cloudflare`.
+- No automatic failover is performed between local and cloudflare in this mode.
 - Pass-1 expects JSON output with `source_ids`, `start`, `end`, `text`.
 - Pass-2 enforces id/length mapping to avoid subtitle desync.
 - Both passes include explicit JSON schema prompts and strict field validation (`--strict-json`, `--no-strict-json`).

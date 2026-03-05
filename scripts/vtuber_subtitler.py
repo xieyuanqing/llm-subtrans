@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import math
@@ -58,9 +59,11 @@ class PipelineConfig:
     url: str
     output: pathlib.Path
     workspace: pathlib.Path
+    asr_provider: str
     asr_api_base: str
     asr_api_key: str
     asr_model: str
+    cloudflare_account_id: str
     llm_api_base: str
     llm_api_key: str
     llm_model: str
@@ -106,7 +109,7 @@ class OpenAICompatClient:
     ) -> list[dict[str, Any]]:
         """Call /audio/transcriptions and return segment dictionaries."""
         url = f"{self.api_base}/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
         payload = {
             "model": model,
@@ -202,18 +205,111 @@ class OpenAICompatClient:
         raise VTuberSubtitlerError("LLM request failed after retries")
 
 
+class CloudflareWhisperClient:
+    """ASR client for Cloudflare Workers AI whisper models."""
+
+    def __init__(
+        self,
+        api_base: str,
+        account_id: str,
+        api_token: str,
+        timeout: float,
+        retries: int,
+        backoff_seconds: float,
+    ):
+        self.api_base = api_base.rstrip('/')
+        self.account_id = account_id
+        self.api_token = api_token
+        self.timeout = timeout
+        self.retries = retries
+        self.backoff_seconds = backoff_seconds
+
+    def transcribe_audio(
+        self,
+        file_path: pathlib.Path,
+        model: str,
+        prompt: str|None,
+    ) -> list[dict[str, Any]]:
+        """Call Cloudflare AI run endpoint for whisper transcription."""
+        url = BuildCloudflareAsrUrl(self.api_base, self.account_id, model)
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json",
+        }
+
+        audio_base64 = base64.b64encode(file_path.read_bytes()).decode("utf-8")
+        payload: dict[str, Any] = {
+            "audio": audio_base64,
+            "task": "transcribe",
+            "language": "ja",
+        }
+        if prompt:
+            payload["initial_prompt"] = prompt
+
+        for attempt in range(1, self.retries + 1):
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                if response.status_code >= 400:
+                    raise VTuberSubtitlerError(
+                        "Cloudflare ASR request failed "
+                        f"({response.status_code}): {response.text[:500]}"
+                    )
+
+                data = response.json()
+                result = data.get("result") if isinstance(data, dict) else None
+                if isinstance(result, dict):
+                    data = result
+
+                segments = data.get("segments") if isinstance(data, dict) else None
+                if isinstance(segments, list):
+                    return [segment for segment in segments if isinstance(segment, dict)]
+
+                text = str(data.get("text") or "").strip() if isinstance(data, dict) else ""
+                if text:
+                    return [{"start": 0.0, "end": 0.0, "text": text}]
+
+                return []
+            except (requests.RequestException, ValueError, VTuberSubtitlerError) as error:
+                if attempt >= self.retries:
+                    raise VTuberSubtitlerError(f"Cloudflare ASR request failed: {error}") from error
+                sleep_seconds = self.backoff_seconds ** attempt
+                logging.warning("Cloudflare ASR request failed, retrying in %.1fs (%s)", sleep_seconds, error)
+                time.sleep(sleep_seconds)
+
+        return []
+
+
 class VTuberSubtitler:
     """End-to-end implementation of the two-pass VTuber subtitle pipeline."""
 
     def __init__(self, config: PipelineConfig):
         self.config = config
-        self.asr_client = OpenAICompatClient(
-            api_base=config.asr_api_base,
-            api_key=config.asr_api_key,
-            timeout=config.request_timeout,
-            retries=config.retry_count,
-            backoff_seconds=config.retry_backoff_seconds,
-        )
+
+        if config.asr_provider == "local":
+            self.asr_client = OpenAICompatClient(
+                api_base=config.asr_api_base,
+                api_key=config.asr_api_key,
+                timeout=config.request_timeout,
+                retries=config.retry_count,
+                backoff_seconds=config.retry_backoff_seconds,
+            )
+        elif config.asr_provider == "cloudflare":
+            self.asr_client = CloudflareWhisperClient(
+                api_base=config.asr_api_base,
+                account_id=config.cloudflare_account_id,
+                api_token=config.asr_api_key,
+                timeout=config.request_timeout,
+                retries=config.retry_count,
+                backoff_seconds=config.retry_backoff_seconds,
+            )
+        else:
+            raise VTuberSubtitlerError(f"Unsupported ASR provider: {config.asr_provider}")
+
         self.llm_client = OpenAICompatClient(
             api_base=config.llm_api_base,
             api_key=config.llm_api_key,
@@ -707,6 +803,13 @@ def ProbeDuration(audio_path: pathlib.Path) -> float:
         raise VTuberSubtitlerError(f"Invalid duration from ffprobe: {value}") from error
 
 
+def BuildCloudflareAsrUrl(api_base: str, account_id: str, model: str) -> str:
+    """Build Cloudflare Workers AI run endpoint URL for ASR model."""
+    normalized_base = api_base.rstrip('/')
+    normalized_model = model.lstrip('/')
+    return f"{normalized_base}/accounts/{account_id}/ai/run/{normalized_model}"
+
+
 def BuildAsrPrompt(metadata: dict[str, Any]) -> str:
     """Compose initial ASR prompt from title/channel metadata."""
     title = str(metadata.get("title") or "").strip()
@@ -1015,9 +1118,44 @@ def BuildArgParser() -> argparse.ArgumentParser:
         help="Workspace directory for downloaded audio and intermediate JSON",
     )
 
-    parser.add_argument("--asr-api-base", default=os.getenv("ASR_API_BASE", "https://api.groq.com/openai/v1"))
-    parser.add_argument("--asr-api-key", default=os.getenv("ASR_API_KEY") or os.getenv("GROQ_API_KEY") or "")
-    parser.add_argument("--asr-model", default=os.getenv("ASR_MODEL", "whisper-large-v3-turbo"))
+    parser.add_argument(
+        "--asr-provider",
+        choices=["local", "cloudflare"],
+        default=os.getenv("ASR_PROVIDER", "local"),
+        help="ASR backend provider. local = your own whisper service, cloudflare = Workers AI whisper",
+    )
+
+    # Local ASR (OpenAI-compatible whisper service)
+    parser.add_argument(
+        "--asr-api-base",
+        default=os.getenv("ASR_API_BASE") or os.getenv("LOCAL_ASR_API_BASE") or "http://127.0.0.1:8000/v1",
+        help="(legacy alias) Local ASR OpenAI-compatible base URL",
+    )
+    parser.add_argument(
+        "--asr-api-key",
+        default=os.getenv("ASR_API_KEY") or os.getenv("LOCAL_ASR_API_KEY") or "",
+        help="(legacy alias) Local ASR API key if your local endpoint requires auth",
+    )
+    parser.add_argument(
+        "--asr-model",
+        default=os.getenv("ASR_MODEL") or os.getenv("LOCAL_ASR_MODEL") or "whisper-large-v3",
+        help="(legacy alias) Local ASR model name",
+    )
+    parser.add_argument("--local-asr-api-base", default=os.getenv("LOCAL_ASR_API_BASE"))
+    parser.add_argument("--local-asr-api-key", default=os.getenv("LOCAL_ASR_API_KEY"))
+    parser.add_argument("--local-asr-model", default=os.getenv("LOCAL_ASR_MODEL"))
+
+    # Cloudflare Workers AI ASR
+    parser.add_argument("--cloudflare-account-id", default=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""))
+    parser.add_argument("--cloudflare-api-token", default=os.getenv("CLOUDFLARE_API_TOKEN", ""))
+    parser.add_argument(
+        "--cloudflare-api-base",
+        default=os.getenv("CLOUDFLARE_API_BASE", "https://api.cloudflare.com/client/v4"),
+    )
+    parser.add_argument(
+        "--cloudflare-asr-model",
+        default=os.getenv("CLOUDFLARE_ASR_MODEL", "@cf/openai/whisper-large-v3-turbo"),
+    )
 
     parser.add_argument("--llm-api-base", default=os.getenv("LLM_API_BASE", "https://api.deepseek.com/v1"))
     parser.add_argument("--llm-api-key", default=os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "")
@@ -1056,21 +1194,56 @@ def BuildArgParser() -> argparse.ArgumentParser:
 
 def BuildConfigFromArgs(args: argparse.Namespace) -> PipelineConfig:
     """Create PipelineConfig from parsed args."""
-    asr_key = str(args.asr_api_key or "").strip()
     llm_key = str(args.llm_api_key or "").strip()
-
-    if not asr_key:
-        raise VTuberSubtitlerError("ASR API key is required (--asr-api-key or ASR_API_KEY/GROQ_API_KEY)")
     if not llm_key:
         raise VTuberSubtitlerError("LLM API key is required (--llm-api-key or LLM_API_KEY/DEEPSEEK_API_KEY)")
+
+    provider = str(args.asr_provider or "local").strip().lower()
+
+    if provider == "local":
+        local_base = str(args.local_asr_api_base or args.asr_api_base or "").strip()
+        local_key = str(args.local_asr_api_key if args.local_asr_api_key is not None else args.asr_api_key or "").strip()
+        local_model = str(args.local_asr_model or args.asr_model or "whisper-large-v3").strip()
+
+        if not local_base:
+            raise VTuberSubtitlerError("Local ASR base URL is required (--local-asr-api-base or --asr-api-base)")
+        if not local_model:
+            raise VTuberSubtitlerError("Local ASR model is required (--local-asr-model or --asr-model)")
+
+        asr_api_base = local_base
+        asr_api_key = local_key
+        asr_model = local_model
+        cloudflare_account_id = ""
+
+    elif provider == "cloudflare":
+        cloudflare_account_id = str(args.cloudflare_account_id or "").strip()
+        cloudflare_token = str(args.cloudflare_api_token or "").strip()
+        cloudflare_base = str(args.cloudflare_api_base or "").strip()
+        cloudflare_model = str(args.cloudflare_asr_model or "@cf/openai/whisper-large-v3-turbo").strip()
+
+        if not cloudflare_account_id:
+            raise VTuberSubtitlerError("Cloudflare account id is required (--cloudflare-account-id)")
+        if not cloudflare_token:
+            raise VTuberSubtitlerError("Cloudflare API token is required (--cloudflare-api-token)")
+        if not cloudflare_base:
+            raise VTuberSubtitlerError("Cloudflare API base is required (--cloudflare-api-base)")
+
+        asr_api_base = cloudflare_base
+        asr_api_key = cloudflare_token
+        asr_model = cloudflare_model
+
+    else:
+        raise VTuberSubtitlerError(f"Unsupported ASR provider: {provider}")
 
     return PipelineConfig(
         url=args.url,
         output=pathlib.Path(args.output).expanduser().resolve(),
         workspace=pathlib.Path(args.workspace).expanduser().resolve(),
-        asr_api_base=str(args.asr_api_base),
-        asr_api_key=asr_key,
-        asr_model=str(args.asr_model),
+        asr_provider=provider,
+        asr_api_base=asr_api_base,
+        asr_api_key=asr_api_key,
+        asr_model=asr_model,
+        cloudflare_account_id=cloudflare_account_id,
         llm_api_base=str(args.llm_api_base),
         llm_api_key=llm_key,
         llm_model=str(args.llm_model),

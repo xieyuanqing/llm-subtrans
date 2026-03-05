@@ -209,9 +209,21 @@ llm-subtrans --list-formats
 python scripts/batch_translate.py ./subtitles ./translated --provider openai --model gpt-5-mini --apikey sk-... --language Spanish
 
 # Experimental VTuber pipeline (YouTube URL -> Chinese SRT)
+# A) local whisper (manual)
 python scripts/vtuber_subtitler.py "https://www.youtube.com/watch?v=<VIDEO_ID>" \
   --output ./output/demo.zh.srt \
-  --asr-api-key "$GROQ_API_KEY" \
+  --asr-provider local \
+  --local-asr-api-base "http://<WINDOWS_HOST>:8000/v1" \
+  --llm-api-key "$DEEPSEEK_API_KEY" \
+  --terminology-lock warn \
+  --strict-json
+
+# B) Cloudflare whisper (manual)
+python scripts/vtuber_subtitler.py "https://www.youtube.com/watch?v=<VIDEO_ID>" \
+  --output ./output/demo.zh.srt \
+  --asr-provider cloudflare \
+  --cloudflare-account-id "$CLOUDFLARE_ACCOUNT_ID" \
+  --cloudflare-api-token "$CLOUDFLARE_API_TOKEN" \
   --llm-api-key "$DEEPSEEK_API_KEY" \
   --terminology-lock warn \
   --strict-json

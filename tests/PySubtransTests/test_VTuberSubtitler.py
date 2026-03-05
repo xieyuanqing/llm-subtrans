@@ -2,6 +2,7 @@ import unittest
 
 from PySubtrans.Helpers.TestCases import LoggedTestCase
 from scripts.vtuber_subtitler import (
+    BuildCloudflareAsrUrl,
     BuildPass1SchemaText,
     BuildPass2SchemaText,
     BuildSrtText,
@@ -63,6 +64,18 @@ class TestVTuberSubtitlerHelpers(LoggedTestCase):
 
         self.assertLoggedIn("pass1 schema contains additionalProperties", '"additionalProperties": false', pass1_schema)
         self.assertLoggedIn("pass2 schema contains id field", '"id": {"type": "integer"}', pass2_schema)
+
+    def test_BuildCloudflareAsrUrl(self):
+        url = BuildCloudflareAsrUrl(
+            api_base="https://api.cloudflare.com/client/v4/",
+            account_id="abc123",
+            model="@cf/openai/whisper-large-v3-turbo",
+        )
+        self.assertLoggedEqual(
+            "cloudflare asr url",
+            "https://api.cloudflare.com/client/v4/accounts/abc123/ai/run/@cf/openai/whisper-large-v3-turbo",
+            url,
+        )
 
     def test_ValidatePassItems(self):
         valid_pass1 = {"source_ids": [1, 2], "text": "こんにちは"}
