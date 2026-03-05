@@ -212,7 +212,9 @@ python scripts/batch_translate.py ./subtitles ./translated --provider openai --m
 python scripts/vtuber_subtitler.py "https://www.youtube.com/watch?v=<VIDEO_ID>" \
   --output ./output/demo.zh.srt \
   --asr-api-key "$GROQ_API_KEY" \
-  --llm-api-key "$DEEPSEEK_API_KEY"
+  --llm-api-key "$DEEPSEEK_API_KEY" \
+  --terminology-lock warn \
+  --strict-json
 ```
 
 The output format is inferred from file extensions. To convert between formats, provide an output path with the desired extension.

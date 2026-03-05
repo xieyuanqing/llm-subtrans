@@ -30,7 +30,9 @@ python scripts/vtuber_subtitler.py \
   --asr-model whisper-large-v3-turbo \
   --llm-api-base https://api.deepseek.com/v1 \
   --llm-api-key "$DEEPSEEK_API_KEY" \
-  --llm-model deepseek-chat
+  --llm-model deepseek-chat \
+  --terminology-lock warn \
+  --strict-json
 ```
 
 Intermediates are written to `./workspace/vtuber_subtitler` by default:
@@ -44,5 +46,7 @@ Intermediates are written to `./workspace/vtuber_subtitler` by default:
 
 - Pass-1 expects JSON output with `source_ids`, `start`, `end`, `text`.
 - Pass-2 enforces id/length mapping to avoid subtitle desync.
+- Both passes include explicit JSON schema prompts and strict field validation (`--strict-json`, `--no-strict-json`).
+- Terminology lock behavior can be controlled with `--terminology-lock off|warn|strict`.
 - Chunk splitting includes small overlap to reduce boundary truncation.
 - If a chunk exceeds the size limit, the script attempts low-bitrate re-encode once.

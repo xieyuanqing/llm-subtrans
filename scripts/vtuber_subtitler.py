@@ -74,6 +74,8 @@ class PipelineConfig:
     retry_count: int = 3
     retry_backoff_seconds: float = 1.8
     glossary_path: pathlib.Path|None = None
+    terminology_lock: str = "warn"
+    strict_json: bool = True
     title_override: str|None = None
     description_override: str|None = None
     channel_override: str|None = None
@@ -509,6 +511,7 @@ class VTuberSubtitler:
                 }
                 for segment in batch
             ]
+            batch_id_set = {segment.id for segment in batch}
 
             system_prompt = (
                 "You are a strict subtitle editor for Japanese speech transcription. "
@@ -519,11 +522,13 @@ class VTuberSubtitler:
             user_prompt = (
                 "Input JSON array (chronological ASR fragments):\n"
                 f"{json.dumps(payload, ensure_ascii=False)}\n\n"
-                "Output requirements:\n"
-                "1) Output a JSON array named items or a root JSON array.\n"
-                "2) Each item must contain: source_ids (array[int]), start, end, text.\n"
-                "3) start MUST equal first source id start. end MUST equal last source id end.\n"
-                "4) Preserve chronological order.\n"
+                "Required output JSON schema:\n"
+                f"{BuildPass1SchemaText()}\n\n"
+                "Hard rules:\n"
+                "1) Output must be a root JSON array or an object with top-level key 'items'.\n"
+                "2) Each item must contain source_ids and text.\n"
+                "3) source_ids must reference ONLY ids from this batch.\n"
+                "4) Keep chronological order.\n"
                 "5) Do not output markdown fences or explanations."
             )
 
@@ -536,11 +541,14 @@ class VTuberSubtitler:
 
             parsed_items = NormalizeArrayPayload(response_json)
             for item in parsed_items:
-                source_ids = ParseSourceIds(item.get("source_ids"), list(id_lookup.keys()))
+                if not ValidatePass1Item(item, strict=self.config.strict_json):
+                    continue
+
+                source_ids = ParseSourceIds(item.get("source_ids"), list(batch_id_set))
                 if not source_ids:
                     continue
 
-                source_segments = [id_lookup[source_id] for source_id in source_ids if source_id in id_lookup]
+                source_segments = [id_lookup[source_id] for source_id in source_ids if source_id in batch_id_set]
                 if not source_segments:
                     continue
 
@@ -572,6 +580,7 @@ class VTuberSubtitler:
         glossary_text = ""
         if self.config.glossary_path and self.config.glossary_path.exists():
             glossary_text = self.config.glossary_path.read_text(encoding="utf-8").strip()
+        glossary_pairs = ParseGlossaryPairs(glossary_text)
 
         translated: list[Segment] = []
 
@@ -580,14 +589,19 @@ class VTuberSubtitler:
             context_start = max(0, offset - self.config.pass2_context_lines)
             context_lines = merged_segments[context_start:offset]
 
-            system_prompt = BuildPass2SystemPrompt(metadata, glossary_text)
+            system_prompt = BuildPass2SystemPrompt(metadata, glossary_text, self.config.terminology_lock)
             user_prompt = (
                 "Context lines (for reference only, DO NOT translate these into output):\n"
                 f"{json.dumps([line.to_dict() for line in context_lines], ensure_ascii=False)}\n\n"
                 "Target lines (translate these only):\n"
                 f"{json.dumps([line.to_dict() for line in batch], ensure_ascii=False)}\n\n"
-                "Return JSON array matching target length exactly. "
-                "Keep id/start/end unchanged and replace text with fluent Simplified Chinese only."
+                "Required output JSON schema:\n"
+                f"{BuildPass2SchemaText()}\n\n"
+                "Hard rules:\n"
+                "1) Return JSON array matching target length exactly.\n"
+                "2) Keep id/start/end unchanged.\n"
+                "3) Replace text with fluent Simplified Chinese only.\n"
+                "4) Do not output markdown fences or explanations."
             )
 
             response_json = self.llm_client.chat_json(
@@ -598,13 +612,18 @@ class VTuberSubtitler:
             )
 
             output_items = NormalizeArrayPayload(response_json)
-            normalized = self.normalize_pass2_output(batch, output_items)
+            normalized = self.normalize_pass2_output(batch, output_items, glossary_pairs)
             translated.extend(normalized)
 
         translated.sort(key=lambda segment: (segment.start, segment.end, segment.id))
         return translated
 
-    def normalize_pass2_output(self, expected_batch: list[Segment], output_items: list[dict[str, Any]]) -> list[Segment]:
+    def normalize_pass2_output(
+        self,
+        expected_batch: list[Segment],
+        output_items: list[dict[str, Any]],
+        glossary_pairs: list[tuple[str, str]],
+    ) -> list[Segment]:
         """Validate pass-2 output against expected IDs and lengths."""
         if not output_items:
             raise VTuberSubtitlerError("Pass-2 returned empty output for a non-empty batch")
@@ -613,6 +632,9 @@ class VTuberSubtitler:
         translated: list[Segment] = []
 
         for item in output_items:
+            if not ValidatePass2Item(item, strict=self.config.strict_json):
+                continue
+
             item_id = SafeInt(item.get("id"))
             if item_id is None or item_id not in expected_by_id:
                 continue
@@ -621,6 +643,13 @@ class VTuberSubtitler:
             text = str(item.get("text") or "").strip()
             if not text:
                 text = expected.text
+
+            text = EnforceTerminologyLocks(
+                source_text=expected.text,
+                translated_text=text,
+                glossary_pairs=glossary_pairs,
+                mode=self.config.terminology_lock,
+            )
 
             translated.append(
                 Segment(
@@ -632,8 +661,9 @@ class VTuberSubtitler:
                 )
             )
 
+        translated_ids = {item.id for item in translated}
         if len(translated) != len(expected_batch):
-            missing_ids = [segment.id for segment in expected_batch if segment.id not in {item.id for item in translated}]
+            missing_ids = [segment.id for segment in expected_batch if segment.id not in translated_ids]
             raise VTuberSubtitlerError(
                 "Pass-2 output did not preserve required id mapping, missing ids: "
                 f"{missing_ids}"
@@ -686,7 +716,7 @@ def BuildAsrPrompt(metadata: dict[str, Any]) -> str:
     return f"Video title: {title}; Channel: {channel}; Please preserve named entities correctly."
 
 
-def BuildPass2SystemPrompt(metadata: dict[str, Any], glossary_text: str) -> str:
+def BuildPass2SystemPrompt(metadata: dict[str, Any], glossary_text: str, terminology_lock: str) -> str:
     """Create pass-2 translation system prompt."""
     title = str(metadata.get("title") or "").strip()
     description = str(metadata.get("description") or "").strip()
@@ -697,6 +727,7 @@ def BuildPass2SystemPrompt(metadata: dict[str, Any], glossary_text: str) -> str:
         "Translate Japanese into natural Simplified Chinese.",
         "Do not summarize, do not omit meaning, and keep line-level alignment by id.",
         "Keep internet slang, game jargon, and VTuber catchphrases consistent.",
+        f"Terminology lock mode: {terminology_lock}.",
     ]
 
     if title:
@@ -708,8 +739,161 @@ def BuildPass2SystemPrompt(metadata: dict[str, Any], glossary_text: str) -> str:
     if glossary_text:
         sections.append(f"Glossary to prioritize:\n{glossary_text[:3000]}")
 
+    sections.append("Strictly follow the output JSON schema provided by the user message.")
     sections.append("Return valid JSON only, no markdown and no extra commentary.")
     return "\n".join(sections)
+
+
+def BuildPass1SchemaText() -> str:
+    """JSON schema text for pass-1 output."""
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["source_ids", "text"],
+            "properties": {
+                "source_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 1,
+                    "uniqueItems": True,
+                },
+                "text": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+                "start": {"type": "number"},
+                "end": {"type": "number"},
+            },
+            "additionalProperties": False,
+        },
+    }
+    return json.dumps(schema, ensure_ascii=False)
+
+
+def BuildPass2SchemaText() -> str:
+    """JSON schema text for pass-2 output."""
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["id", "start", "end", "text"],
+            "properties": {
+                "id": {"type": "integer"},
+                "start": {"type": "number"},
+                "end": {"type": "number"},
+                "text": {"type": "string", "minLength": 1},
+            },
+            "additionalProperties": False,
+        },
+    }
+    return json.dumps(schema, ensure_ascii=False)
+
+
+def ValidatePass1Item(item: dict[str, Any], strict: bool = True) -> bool:
+    """Validate pass-1 item shape and required fields."""
+    required_keys = {"source_ids", "text"}
+    allowed_keys = {"source_ids", "start", "end", "text"}
+
+    if strict and not set(item.keys()).issubset(allowed_keys):
+        return False
+    if not required_keys.issubset(set(item.keys())):
+        return False
+
+    source_ids = item.get("source_ids")
+    text = item.get("text")
+
+    if not isinstance(source_ids, list) or not source_ids:
+        return False
+    if not isinstance(text, str) or not text.strip():
+        return False
+
+    parsed_ids = [SafeInt(value) for value in source_ids]
+    return all(value is not None for value in parsed_ids)
+
+
+def ValidatePass2Item(item: dict[str, Any], strict: bool = True) -> bool:
+    """Validate pass-2 item shape and required fields."""
+    required_keys = {"id", "start", "end", "text"}
+    allowed_keys = {"id", "start", "end", "text"}
+
+    if strict and not set(item.keys()).issubset(allowed_keys):
+        return False
+    if not required_keys.issubset(set(item.keys())):
+        return False
+
+    if SafeInt(item.get("id")) is None:
+        return False
+    if not isinstance(item.get("text"), str) or not str(item.get("text") or "").strip():
+        return False
+
+    return True
+
+
+def ParseGlossaryPairs(glossary_text: str) -> list[tuple[str, str]]:
+    """Parse glossary text into source->target terminology pairs."""
+    pairs: list[tuple[str, str]] = []
+    if not glossary_text.strip():
+        return pairs
+
+    for raw_line in glossary_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        separator = None
+        for marker in ("::", "=>", "->", "\t"):
+            if marker in line:
+                separator = marker
+                break
+
+        if separator is None:
+            continue
+
+        left, right = line.split(separator, 1)
+        source = left.strip()
+        target = right.strip()
+        if not source or not target:
+            continue
+
+        pairs.append((source, target))
+
+    return pairs
+
+
+def EnforceTerminologyLocks(
+    source_text: str,
+    translated_text: str,
+    glossary_pairs: list[tuple[str, str]],
+    mode: str,
+) -> str:
+    """Apply glossary lock checks to translated text."""
+    if mode == "off" or not glossary_pairs:
+        return translated_text
+
+    result = translated_text
+    missing_terms: list[str] = []
+
+    for source_term, target_term in glossary_pairs:
+        if source_term not in source_text:
+            continue
+
+        if target_term in result:
+            continue
+
+        if source_term in result:
+            result = result.replace(source_term, target_term)
+            continue
+
+        missing_terms.append(f"{source_term}->{target_term}")
+
+    if missing_terms:
+        message = f"Terminology lock miss: {', '.join(missing_terms)}"
+        if mode == "strict":
+            raise VTuberSubtitlerError(message)
+        logging.warning(message)
+
+    return result
 
 
 def ParseJsonFromText(text: str) -> Any:
@@ -850,6 +1034,18 @@ def BuildArgParser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-backoff-seconds", type=float, default=1.8)
 
     parser.add_argument("--glossary", help="Path to glossary text file")
+    parser.add_argument(
+        "--terminology-lock",
+        choices=["off", "warn", "strict"],
+        default="warn",
+        help="Terminology lock mode when glossary terms appear in source text",
+    )
+    parser.add_argument(
+        "--strict-json",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable strict output field validation for pass-1 and pass-2",
+    )
     parser.add_argument("--title", help="Override title metadata")
     parser.add_argument("--description", help="Override description metadata")
     parser.add_argument("--channel", help="Override channel metadata")
@@ -888,6 +1084,8 @@ def BuildConfigFromArgs(args: argparse.Namespace) -> PipelineConfig:
         retry_count=int(args.retry_count),
         retry_backoff_seconds=float(args.retry_backoff_seconds),
         glossary_path=pathlib.Path(args.glossary).expanduser().resolve() if args.glossary else None,
+        terminology_lock=str(args.terminology_lock),
+        strict_json=bool(args.strict_json),
         title_override=args.title,
         description_override=args.description,
         channel_override=args.channel,

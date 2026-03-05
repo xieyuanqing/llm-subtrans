@@ -2,12 +2,18 @@ import unittest
 
 from PySubtrans.Helpers.TestCases import LoggedTestCase
 from scripts.vtuber_subtitler import (
+    BuildPass1SchemaText,
+    BuildPass2SchemaText,
     BuildSrtText,
+    EnforceTerminologyLocks,
     FormatSrtTimestamp,
     NormalizeArrayPayload,
+    ParseGlossaryPairs,
     ParseJsonFromText,
     ParseSourceIds,
     Segment,
+    ValidatePass1Item,
+    ValidatePass2Item,
 )
 
 
@@ -50,6 +56,41 @@ class TestVTuberSubtitlerHelpers(LoggedTestCase):
 
         self.assertLoggedIn("first cue index", "1\n00:00:00,100 --> 00:00:01,200\n第一句", srt_text)
         self.assertLoggedIn("second cue index", "2\n00:00:02,500 --> 00:00:04,000\n第二句", srt_text)
+
+    def test_BuildSchemaTexts(self):
+        pass1_schema = BuildPass1SchemaText()
+        pass2_schema = BuildPass2SchemaText()
+
+        self.assertLoggedIn("pass1 schema contains additionalProperties", '"additionalProperties": false', pass1_schema)
+        self.assertLoggedIn("pass2 schema contains id field", '"id": {"type": "integer"}', pass2_schema)
+
+    def test_ValidatePassItems(self):
+        valid_pass1 = {"source_ids": [1, 2], "text": "こんにちは"}
+        invalid_pass1 = {"source_ids": [], "text": ""}
+
+        valid_pass2 = {"id": 1, "start": 0.0, "end": 1.0, "text": "你好"}
+        invalid_pass2 = {"id": "bad", "start": 0.0, "end": 1.0, "text": ""}
+
+        self.assertLoggedTrue("validate pass1 valid item", ValidatePass1Item(valid_pass1, strict=True))
+        self.assertLoggedFalse("validate pass1 invalid item", ValidatePass1Item(invalid_pass1, strict=True))
+        self.assertLoggedTrue("validate pass2 valid item", ValidatePass2Item(valid_pass2, strict=True))
+        self.assertLoggedFalse("validate pass2 invalid item", ValidatePass2Item(invalid_pass2, strict=True))
+
+    def test_GlossaryParsingAndTerminologyLock(self):
+        glossary_text = """
+# comment
+ぺこら::佩可拉
+草=>笑死
+""".strip()
+        pairs = ParseGlossaryPairs(glossary_text)
+
+        self.assertLoggedEqual("glossary pair count", 2, len(pairs))
+
+        source = "ぺこら、今日も草"
+        translated = "ぺこら今天也太草了"
+        locked = EnforceTerminologyLocks(source, translated, pairs, mode="warn")
+
+        self.assertLoggedIn("terminology replacement applied", "佩可拉", locked)
 
 
 if __name__ == '__main__':
