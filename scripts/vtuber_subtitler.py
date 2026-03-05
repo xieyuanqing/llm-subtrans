@@ -1157,9 +1157,21 @@ def BuildArgParser() -> argparse.ArgumentParser:
         default=os.getenv("CLOUDFLARE_ASR_MODEL", "@cf/openai/whisper-large-v3-turbo"),
     )
 
-    parser.add_argument("--llm-api-base", default=os.getenv("LLM_API_BASE", "https://api.deepseek.com/v1"))
-    parser.add_argument("--llm-api-key", default=os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "")
-    parser.add_argument("--llm-model", default=os.getenv("LLM_MODEL", "deepseek-chat"))
+    parser.add_argument(
+        "--llm-api-base",
+        default=os.getenv("LLM_API_BASE", "http://localhost:3000/v1"),
+        help="LLM API base. Default points at your configured New API gateway.",
+    )
+    parser.add_argument(
+        "--llm-api-key",
+        default=os.getenv("LLM_API_KEY") or os.getenv("NEWAPI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "",
+        help="LLM API key for the New API / chat completions endpoint.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=os.getenv("LLM_MODEL", "deepseek-ai/DeepSeek-V3.2"),
+        help="LLM model for pass-1/pass-2. Default matches your stable New API DeepSeek V3.2 setup.",
+    )
 
     parser.add_argument("--max-chunk-mb", type=float, default=5.0)
     parser.add_argument("--overlap-seconds", type=float, default=0.5)
@@ -1196,7 +1208,7 @@ def BuildConfigFromArgs(args: argparse.Namespace) -> PipelineConfig:
     """Create PipelineConfig from parsed args."""
     llm_key = str(args.llm_api_key or "").strip()
     if not llm_key:
-        raise VTuberSubtitlerError("LLM API key is required (--llm-api-key or LLM_API_KEY/DEEPSEEK_API_KEY)")
+        raise VTuberSubtitlerError("LLM API key is required (--llm-api-key or LLM_API_KEY/NEWAPI_API_KEY/DEEPSEEK_API_KEY)")
 
     provider = str(args.asr_provider or "local").strip().lower()
 

@@ -20,25 +20,31 @@ Script: `scripts/vtuber_subtitler.py`
 - Cloudflare ASR mode: Workers AI account + API token
 - LLM endpoint compatible with `/chat/completions`
 
-## Quick Start
+## Intended Workflow
 
-### A) Local 4060 Whisper (manual mode)
+This pipeline is meant to be run by the assistant on the VPS after you provide the video/task.
+The operator does not need to remember commands; the assistant chooses the ASR backend and runs the pipeline.
+
+## Reference Commands
+
+### A) Local 4060 Whisper (assistant-run, preferred)
 
 ```bash
 python scripts/vtuber_subtitler.py \
   "https://www.youtube.com/watch?v=<VIDEO_ID>" \
   --output ./output/demo.zh.srt \
   --asr-provider local \
-  --local-asr-api-base "http://<WINDOWS_HOST>:8000/v1" \
+  --local-asr-api-base "http://100.74.157.37:8000/v1" \
+  --local-asr-api-key "$LOCAL_ASR_API_KEY" \
   --local-asr-model whisper-large-v3 \
-  --llm-api-base https://api.deepseek.com/v1 \
-  --llm-api-key "$DEEPSEEK_API_KEY" \
-  --llm-model deepseek-chat \
+  --llm-api-base http://localhost:3000/v1 \
+  --llm-api-key "$NEWAPI_API_KEY" \
+  --llm-model deepseek-ai/DeepSeek-V3.2 \
   --terminology-lock warn \
   --strict-json
 ```
 
-### B) Cloudflare Whisper (manual mode)
+### B) Cloudflare Whisper (assistant-run, manual fallback)
 
 ```bash
 python scripts/vtuber_subtitler.py \
@@ -48,9 +54,9 @@ python scripts/vtuber_subtitler.py \
   --cloudflare-account-id "$CLOUDFLARE_ACCOUNT_ID" \
   --cloudflare-api-token "$CLOUDFLARE_API_TOKEN" \
   --cloudflare-asr-model "@cf/openai/whisper-large-v3-turbo" \
-  --llm-api-base https://api.deepseek.com/v1 \
-  --llm-api-key "$DEEPSEEK_API_KEY" \
-  --llm-model deepseek-chat \
+  --llm-api-base http://localhost:3000/v1 \
+  --llm-api-key "$NEWAPI_API_KEY" \
+  --llm-model deepseek-ai/DeepSeek-V3.2 \
   --terminology-lock warn \
   --strict-json
 ```
@@ -66,6 +72,8 @@ Intermediates are written to `./workspace/vtuber_subtitler` by default:
 
 - ASR provider is manual: choose `--asr-provider local` or `--asr-provider cloudflare`.
 - No automatic failover is performed between local and cloudflare in this mode.
+- Default LLM path should use your configured New API gateway with `deepseek-ai/DeepSeek-V3.2` unless you explicitly switch it.
+- Operationally, this is an assistant-run pipeline on the VPS, not an end-user self-serve CLI workflow.
 - Pass-1 expects JSON output with `source_ids`, `start`, `end`, `text`.
 - Pass-2 enforces id/length mapping to avoid subtitle desync.
 - Both passes include explicit JSON schema prompts and strict field validation (`--strict-json`, `--no-strict-json`).

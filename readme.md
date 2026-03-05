@@ -208,23 +208,28 @@ llm-subtrans --list-formats
 # Batch process files in a folder tree (activate the virtual environment first)
 python scripts/batch_translate.py ./subtitles ./translated --provider openai --model gpt-5-mini --apikey sk-... --language Spanish
 
-# Experimental VTuber pipeline (YouTube URL -> Chinese SRT)
-# A) local whisper (manual)
+# Experimental VTuber pipeline (assistant-run on VPS)
+# A) local whisper (preferred)
 python scripts/vtuber_subtitler.py "https://www.youtube.com/watch?v=<VIDEO_ID>" \
   --output ./output/demo.zh.srt \
   --asr-provider local \
-  --local-asr-api-base "http://<WINDOWS_HOST>:8000/v1" \
-  --llm-api-key "$DEEPSEEK_API_KEY" \
+  --local-asr-api-base "http://100.74.157.37:8000/v1" \
+  --local-asr-api-key "$LOCAL_ASR_API_KEY" \
+  --llm-api-base http://localhost:3000/v1 \
+  --llm-api-key "$NEWAPI_API_KEY" \
+  --llm-model deepseek-ai/DeepSeek-V3.2 \
   --terminology-lock warn \
   --strict-json
 
-# B) Cloudflare whisper (manual)
+# B) Cloudflare whisper (manual fallback)
 python scripts/vtuber_subtitler.py "https://www.youtube.com/watch?v=<VIDEO_ID>" \
   --output ./output/demo.zh.srt \
   --asr-provider cloudflare \
   --cloudflare-account-id "$CLOUDFLARE_ACCOUNT_ID" \
   --cloudflare-api-token "$CLOUDFLARE_API_TOKEN" \
-  --llm-api-key "$DEEPSEEK_API_KEY" \
+  --llm-api-base http://localhost:3000/v1 \
+  --llm-api-key "$NEWAPI_API_KEY" \
+  --llm-model deepseek-ai/DeepSeek-V3.2 \
   --terminology-lock warn \
   --strict-json
 ```
