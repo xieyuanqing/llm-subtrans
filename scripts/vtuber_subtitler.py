@@ -600,6 +600,7 @@ class VTuberSubtitler:
         merged = self.rule_based_initial_segments(raw_segments, id_lookup)
         merged = self.refine_oversized_segments(merged, id_lookup)
         merged = SplitOversizedMergedSegments(merged, id_lookup, max_duration=9.5, max_chars=48)
+        merged = self.recover_missing_pass1_segments(raw_segments, merged, id_lookup)
         merged = NormalizeSegmentIds(merged)
         return merged
 
@@ -777,6 +778,97 @@ class VTuberSubtitler:
                 refined_map[segment.id] = rebuilt
 
         return refined_map
+
+    def recover_missing_pass1_segments(
+        self,
+        raw_segments: list[Segment],
+        merged_segments: list[Segment],
+        id_lookup: dict[int, Segment],
+    ) -> list[Segment]:
+        """Repair pass-1 coverage by reprocessing missing raw ids only."""
+        expected_ids = [segment.id for segment in raw_segments if str(segment.text or "").strip()]
+        covered_ids = CollectCoveredSourceIds(merged_segments)
+        missing_ids = [source_id for source_id in expected_ids if source_id not in covered_ids]
+        if not missing_ids:
+            return merged_segments
+
+        logging.warning("Pass-1 coverage missing %d ids, running targeted repair", len(missing_ids))
+        recovered: list[Segment] = []
+        for group in GroupContiguousIds(missing_ids):
+            group_segments = [id_lookup[source_id] for source_id in group if source_id in id_lookup]
+            if not group_segments:
+                continue
+            payload = [
+                {
+                    "id": item.id,
+                    "start": item.start,
+                    "end": item.end,
+                    "text": item.text,
+                }
+                for item in group_segments
+            ]
+            user_prompt = (
+                "Repair missing subtitle fragments by merging only this small JSON array.\n"
+                f"{json.dumps(payload, ensure_ascii=False)}\n\n"
+                "Return JSON schema:\n"
+                f"{BuildPass1SchemaText()}\n\n"
+                "Rules:\n"
+                "1) JSON only.\n"
+                "2) source_ids must use only ids from this payload.\n"
+                "3) Keep chronological order.\n"
+                "4) Preserve meaning; do not drop any source fragment."
+            )
+            response_json = self.llm_client.chat_json(
+                model=self.config.llm_model,
+                system_prompt="You repair missing Japanese subtitle fragments and return strict JSON only.",
+                user_prompt=user_prompt,
+                temperature=0.0,
+            )
+            items = NormalizeArrayPayload(response_json)
+            valid_ids = [item.id for item in group_segments]
+            for item in items:
+                if not ValidatePass1Item(item, strict=self.config.strict_json):
+                    continue
+                source_ids = ParseSourceIds(item.get("source_ids"), valid_ids)
+                if not source_ids:
+                    continue
+                source_parts = [id_lookup[source_id] for source_id in source_ids if source_id in id_lookup]
+                if not source_parts:
+                    continue
+                source_parts.sort(key=lambda value: (value.start, value.end, value.id))
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                recovered.append(
+                    Segment(
+                        id=0,
+                        start=source_parts[0].start,
+                        end=source_parts[-1].end,
+                        text=text,
+                        source_ids=[value.id for value in source_parts],
+                    )
+                )
+
+        combined = merged_segments + recovered
+        covered_after = CollectCoveredSourceIds(combined)
+        still_missing = [source_id for source_id in expected_ids if source_id not in covered_after]
+        if still_missing:
+            logging.warning("Pass-1 repair still missing %d ids, fallback to raw append", len(still_missing))
+            for source_id in still_missing:
+                source = id_lookup.get(source_id)
+                if not source:
+                    continue
+                combined.append(
+                    Segment(
+                        id=0,
+                        start=source.start,
+                        end=source.end,
+                        text=source.text,
+                        source_ids=[source.id],
+                    )
+                )
+
+        return EnsureNonOverlappingSourceCoverage(combined, id_lookup)
 
     def contextual_translate(
         self,
@@ -1060,6 +1152,28 @@ def IsOversizedSegment(segment: Segment, max_duration: float = 8.0, max_chars: i
     """Return True when a segment violates hard subtitle limits."""
     duration = max(0.0, segment.end - segment.start)
     return duration > max_duration or len(segment.text) > max_chars
+
+
+def CollectCoveredSourceIds(segments: list[Segment]) -> set[int]:
+    """Return all source ids covered by current merged segments."""
+    covered: set[int] = set()
+    for segment in segments:
+        covered.update(int(source_id) for source_id in segment.source_ids)
+    return covered
+
+
+def GroupContiguousIds(source_ids: list[int]) -> list[list[int]]:
+    """Group sorted ids into contiguous ranges for low-token repair prompts."""
+    if not source_ids:
+        return []
+    ordered = sorted(set(int(value) for value in source_ids))
+    groups: list[list[int]] = [[ordered[0]]]
+    for value in ordered[1:]:
+        if value == groups[-1][-1] + 1:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+    return groups
 
 
 def EnsureNonOverlappingSourceCoverage(
