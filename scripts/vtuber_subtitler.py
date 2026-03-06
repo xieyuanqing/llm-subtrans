@@ -1218,7 +1218,7 @@ def MergeAdjacentShortSegments(
     max_duration: float = 8.5,
     max_chars: int = 42,
 ) -> list[Segment]:
-    """Merge nearby short subtitle lines only when they read as one thought."""
+    """Merge nearby short subtitle lines with generic break+score rules."""
     ordered = sorted(segments, key=lambda segment: (segment.start, segment.end, segment.id))
     if not ordered:
         return []
@@ -1233,9 +1233,7 @@ def MergeAdjacentShortSegments(
         combined_text = JoinSubtitleTexts(previous.text, current.text)
         combined_duration = current.end - previous.start
         should_merge = (
-            gap <= 0.36
-            and (previous_duration <= 2.3 or current_duration <= 2.3)
-            and len(combined_text) <= max_chars
+            len(combined_text) <= max_chars
             and combined_duration <= max_duration
             and ShouldMergeSubtitleTexts(
                 previous.text,
@@ -1283,11 +1281,13 @@ def ShouldMergeSubtitleTexts(
     previous_duration: float = 0.0,
     current_duration: float = 0.0,
 ) -> bool:
-    """Return True only when adjacent short texts feel like one continued thought."""
+    """Generic break-rules + lightweight semantic scoring for subtitle merging."""
     left = left.strip()
     right = right.strip()
     if not left or not right:
         return False
+
+    # ---- Generic hard break rules ----
     if merge_count >= 1:
         return False
 
@@ -1297,30 +1297,39 @@ def ShouldMergeSubtitleTexts(
     emotional_endings = ("啊", "呢", "吧", "哦", "哇", "嘛", "草", "w")
     continuation_starts = ("而", "但", "然后", "所以", "于是", "因为", "就是", "那个", "还", "就", "也", "又")
 
-    ultra_short = (len(left) <= 4 or len(right) <= 4 or previous_duration <= 1.2 or current_duration <= 1.2)
+    ultra_short = (len(left) <= 5 or len(right) <= 5 or previous_duration <= 1.2 or current_duration <= 1.2)
+    gap_ratio = gap / max(0.001, previous_duration)
 
+    # punctuation wall
     if left.endswith(strong_hard_stop):
         return False
-    if left.endswith(hard_stop_punct):
-        if not ultra_short:
-            return False
-        if gap > 0.12:
-            return False
-
-    if gap >= 0.24:
-        return False
-    if any(left.endswith(ending) for ending in emotional_endings) and gap >= 0.18:
+    if left.endswith(hard_stop_punct) and not ultra_short:
         return False
 
+    # dynamic gap gate
+    if gap > 0.30:
+        return False
+    if gap_ratio > 0.30:
+        return False
+
+    # emotional release words + pause => break
+    if any(left.endswith(ending) for ending in emotional_endings) and gap >= 0.20:
+        return False
+
+    # ---- Lightweight semantic score ----
+    score = 0
     if right.startswith(continuation_starts):
-        return True
+        score += 2
     if left.endswith(soft_continue_punct):
-        return True
-    if ultra_short and gap <= 0.2:
-        return True
-    if not left.endswith(("。", "？", "?", "！", "!")):
-        return True
-    return False
+        score += 2
+    if ultra_short:
+        score += 1
+    if gap <= 0.12:
+        score += 1
+    if left.endswith(hard_stop_punct):
+        score -= 1
+
+    return score >= 1
 
 
 def ResplitTranslatedSegments(
