@@ -325,6 +325,15 @@ class VTuberSubtitler:
             retries=config.retry_count,
             backoff_seconds=config.retry_backoff_seconds,
         )
+        self.reasr_report: dict[str, Any] = {
+            "enabled": bool(config.enable_targeted_reasr),
+            "summary": {
+                "low_candidate_count": 0,
+                "improved_count": 0,
+                "attempted_count": 0,
+            },
+            "segments": [],
+        }
 
     def run(self) -> pathlib.Path:
         """Execute all stages and return output SRT path."""
@@ -348,6 +357,8 @@ class VTuberSubtitler:
         if not raw_segments:
             raise VTuberSubtitlerError("ASR returned no subtitle segments")
         self.write_json(self.config.workspace / "raw_asr.json", [s.to_dict() for s in raw_segments])
+        if self.config.enable_targeted_reasr:
+            self.write_json(self.config.workspace / "reasr_report.json", self.reasr_report)
 
         logging.info("Phase 3/5: semantic reorganization pass")
         merged = self.semantic_reorganize(raw_segments)
@@ -633,6 +644,8 @@ class VTuberSubtitler:
             if score < self.config.reasr_score_threshold
         ][:max(1, self.config.reasr_max_segments)]
 
+        self.reasr_report["summary"]["low_candidate_count"] = len(low_candidates)
+
         if not low_candidates:
             logging.info("Targeted re-ASR skipped: no low-score segments")
             return
@@ -641,15 +654,21 @@ class VTuberSubtitler:
         temp_dir.mkdir(parents=True, exist_ok=True)
         base_prompt = BuildAsrPrompt(metadata)
         improved = 0
+        attempted = 0
+        report_segments: list[dict[str, Any]] = []
 
         for old_score, record in low_candidates:
             segment = record["segment"]
+            old_text = segment.text
             window_start = max(0.0, segment.start - self.config.reasr_window_pad)
             window_end = max(window_start + 0.2, segment.end + self.config.reasr_window_pad)
 
-            best_text = segment.text
+            best_text = old_text
             best_score = old_score
             identical_hits = 0
+            attempts_log: list[dict[str, Any]] = []
+            stop_reason = "max_attempts"
+            attempted += 1
 
             for attempt in range(1, max(1, self.config.reasr_attempts) + 1):
                 slice_path = temp_dir / f"seg_{segment.id:05d}_a{attempt}.m4a"
@@ -676,17 +695,25 @@ class VTuberSubtitler:
                         prompt=prompt,
                     )
                 except VTuberSubtitlerError as error:
+                    attempts_log.append(
+                        {
+                            "attempt": attempt,
+                            "status": "error",
+                            "error": str(error),
+                        }
+                    )
                     logging.warning("Targeted re-ASR failed for seg %d attempt %d: %s", segment.id, attempt, error)
                     continue
 
                 candidate_text = MergeAsrTexts(retry_items)
                 if not candidate_text:
-                    continue
-
-                if NormalizeComparableText(candidate_text) == NormalizeComparableText(best_text):
-                    identical_hits += 1
-                    if identical_hits >= 2:
-                        break
+                    attempts_log.append(
+                        {
+                            "attempt": attempt,
+                            "status": "empty",
+                            "candidate_text": "",
+                        }
+                    )
                     continue
 
                 candidate_score = EstimateAsrSegmentScore(
@@ -694,23 +721,68 @@ class VTuberSubtitler:
                     duration=max(0.0, window_end - window_start),
                     raw_item=retry_items[0] if retry_items else None,
                 )
+                is_identical = NormalizeComparableText(candidate_text) == NormalizeComparableText(best_text)
+                attempts_log.append(
+                    {
+                        "attempt": attempt,
+                        "status": "ok",
+                        "candidate_text": candidate_text,
+                        "candidate_score": candidate_score,
+                        "same_as_current_best": is_identical,
+                    }
+                )
+
+                if is_identical:
+                    identical_hits += 1
+                    if identical_hits >= 2:
+                        stop_reason = "identical_short_circuit"
+                        break
+                    continue
+
                 if candidate_score > best_score:
                     best_score = candidate_score
                     best_text = candidate_text
 
-            if NormalizeComparableText(best_text) == NormalizeComparableText(segment.text):
-                continue
-            if best_score < old_score + self.config.reasr_min_improvement:
-                continue
+            accepted = False
+            reject_reason = ""
+            if NormalizeComparableText(best_text) == NormalizeComparableText(old_text):
+                reject_reason = "no_text_change"
+            elif best_score < old_score + self.config.reasr_min_improvement:
+                reject_reason = "insufficient_improvement"
+            else:
+                accepted = True
 
-            logging.info(
-                "Targeted re-ASR accepted seg %d: %.1f -> %.1f",
-                segment.id,
-                old_score,
-                best_score,
+            if accepted:
+                logging.info(
+                    "Targeted re-ASR accepted seg %d: %.1f -> %.1f",
+                    segment.id,
+                    old_score,
+                    best_score,
+                )
+                segment.text = best_text
+                improved += 1
+
+            report_segments.append(
+                {
+                    "segment_id": segment.id,
+                    "start": round(segment.start, 3),
+                    "end": round(segment.end, 3),
+                    "window_start": round(window_start, 3),
+                    "window_end": round(window_end, 3),
+                    "old_text": old_text,
+                    "old_score": old_score,
+                    "best_text": best_text,
+                    "best_score": best_score,
+                    "accepted": accepted,
+                    "reject_reason": reject_reason,
+                    "stop_reason": stop_reason,
+                    "attempts": attempts_log,
+                }
             )
-            segment.text = best_text
-            improved += 1
+
+        self.reasr_report["summary"]["improved_count"] = improved
+        self.reasr_report["summary"]["attempted_count"] = attempted
+        self.reasr_report["segments"] = report_segments
 
         logging.info(
             "Targeted re-ASR done: improved %d/%d low-score segments",
