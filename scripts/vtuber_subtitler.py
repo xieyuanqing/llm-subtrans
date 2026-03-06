@@ -84,6 +84,12 @@ class PipelineConfig:
     title_override: str|None = None
     description_override: str|None = None
     channel_override: str|None = None
+    enable_targeted_reasr: bool = False
+    reasr_score_threshold: float = 60.0
+    reasr_max_segments: int = 8
+    reasr_attempts: int = 2
+    reasr_window_pad: float = 0.2
+    reasr_min_improvement: float = 8.0
 
 
 class OpenAICompatClient:
@@ -319,6 +325,15 @@ class VTuberSubtitler:
             retries=config.retry_count,
             backoff_seconds=config.retry_backoff_seconds,
         )
+        self.reasr_report: dict[str, Any] = {
+            "enabled": bool(config.enable_targeted_reasr),
+            "summary": {
+                "low_candidate_count": 0,
+                "improved_count": 0,
+                "attempted_count": 0,
+            },
+            "segments": [],
+        }
 
     def run(self) -> pathlib.Path:
         """Execute all stages and return output SRT path."""
@@ -338,10 +353,12 @@ class VTuberSubtitler:
             raise VTuberSubtitlerError("No audio chunks were generated")
 
         logging.info("Phase 2/5: ASR transcription (%d chunks)", len(chunks))
-        raw_segments = self.transcribe_chunks(chunks, metadata)
+        raw_segments = self.transcribe_chunks(chunks, metadata, audio_path)
         if not raw_segments:
             raise VTuberSubtitlerError("ASR returned no subtitle segments")
         self.write_json(self.config.workspace / "raw_asr.json", [s.to_dict() for s in raw_segments])
+        if self.config.enable_targeted_reasr:
+            self.write_json(self.config.workspace / "reasr_report.json", self.reasr_report)
 
         logging.info("Phase 3/5: semantic reorganization pass")
         merged = self.semantic_reorganize(raw_segments)
@@ -549,10 +566,11 @@ class VTuberSubtitler:
         self,
         chunks: list[AudioChunk],
         metadata: dict[str, Any],
+        source_audio: pathlib.Path,
     ) -> list[Segment]:
         """Run ASR for each chunk and map local timestamps back to source timeline."""
         initial_prompt = BuildAsrPrompt(metadata)
-        global_segments: list[Segment] = []
+        records: list[dict[str, Any]] = []
         next_id = 1
 
         for chunk in chunks:
@@ -577,21 +595,200 @@ class VTuberSubtitler:
                 if midpoint < chunk.keep_start or midpoint > chunk.keep_end:
                     continue
 
-                global_segments.append(
-                    Segment(
-                        id=next_id,
-                        start=round(max(0.0, absolute_start), 3),
-                        end=round(max(absolute_end, absolute_start), 3),
-                        text=text,
-                    )
+                segment = Segment(
+                    id=next_id,
+                    start=round(max(0.0, absolute_start), 3),
+                    end=round(max(absolute_end, absolute_start), 3),
+                    text=text,
+                )
+                records.append(
+                    {
+                        "segment": segment,
+                        "raw_item": item,
+                        "chunk": chunk,
+                    }
                 )
                 next_id += 1
 
-        if not global_segments:
+        if not records:
             return []
 
+        if self.config.enable_targeted_reasr:
+            self.relisten_low_score_segments(records, source_audio, metadata)
+
+        global_segments = [record["segment"] for record in records]
         global_segments.sort(key=lambda segment: (segment.start, segment.end, segment.id))
         return global_segments
+
+    def relisten_low_score_segments(
+        self,
+        records: list[dict[str, Any]],
+        source_audio: pathlib.Path,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Targeted re-ASR for low-score segments only, with strict no-gain short-circuit."""
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for record in records:
+            segment = record["segment"]
+            raw_item = record.get("raw_item") if isinstance(record, dict) else None
+            score = EstimateAsrSegmentScore(
+                text=segment.text,
+                duration=max(0.0, segment.end - segment.start),
+                raw_item=raw_item if isinstance(raw_item, dict) else None,
+            )
+            scored.append((score, record))
+
+        scored.sort(key=lambda item: item[0])
+        low_candidates = [
+            (score, record) for score, record in scored
+            if score < self.config.reasr_score_threshold
+        ][:max(1, self.config.reasr_max_segments)]
+
+        self.reasr_report["summary"]["low_candidate_count"] = len(low_candidates)
+
+        if not low_candidates:
+            logging.info("Targeted re-ASR skipped: no low-score segments")
+            return
+
+        temp_dir = self.config.workspace / "reasr_tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        base_prompt = BuildAsrPrompt(metadata)
+        improved = 0
+        attempted = 0
+        report_segments: list[dict[str, Any]] = []
+
+        for old_score, record in low_candidates:
+            segment = record["segment"]
+            old_text = segment.text
+            window_start = max(0.0, segment.start - self.config.reasr_window_pad)
+            window_end = max(window_start + 0.2, segment.end + self.config.reasr_window_pad)
+
+            best_text = old_text
+            best_score = old_score
+            identical_hits = 0
+            attempts_log: list[dict[str, Any]] = []
+            stop_reason = "max_attempts"
+            attempted += 1
+
+            for attempt in range(1, max(1, self.config.reasr_attempts) + 1):
+                slice_path = temp_dir / f"seg_{segment.id:05d}_a{attempt}.m4a"
+                self.extract_audio_slice(
+                    source_audio=source_audio,
+                    destination=slice_path,
+                    start_seconds=window_start,
+                    end_seconds=window_end,
+                    reencode=True,
+                )
+
+                prompt = base_prompt
+                if attempt > 1:
+                    prompt = (
+                        f"{base_prompt}\n"
+                        "Focus on literal hearing. Do not omit short interjections.\n"
+                        f"Previous draft: {best_text}"
+                    )
+
+                try:
+                    retry_items = self.asr_client.transcribe_audio(
+                        file_path=slice_path,
+                        model=self.config.asr_model,
+                        prompt=prompt,
+                    )
+                except VTuberSubtitlerError as error:
+                    attempts_log.append(
+                        {
+                            "attempt": attempt,
+                            "status": "error",
+                            "error": str(error),
+                        }
+                    )
+                    logging.warning("Targeted re-ASR failed for seg %d attempt %d: %s", segment.id, attempt, error)
+                    continue
+
+                candidate_text = MergeAsrTexts(retry_items)
+                if not candidate_text:
+                    attempts_log.append(
+                        {
+                            "attempt": attempt,
+                            "status": "empty",
+                            "candidate_text": "",
+                        }
+                    )
+                    continue
+
+                candidate_score = EstimateAsrSegmentScore(
+                    text=candidate_text,
+                    duration=max(0.0, window_end - window_start),
+                    raw_item=retry_items[0] if retry_items else None,
+                )
+                is_identical = NormalizeComparableText(candidate_text) == NormalizeComparableText(best_text)
+                attempts_log.append(
+                    {
+                        "attempt": attempt,
+                        "status": "ok",
+                        "candidate_text": candidate_text,
+                        "candidate_score": candidate_score,
+                        "same_as_current_best": is_identical,
+                    }
+                )
+
+                if is_identical:
+                    identical_hits += 1
+                    if identical_hits >= 2:
+                        stop_reason = "identical_short_circuit"
+                        break
+                    continue
+
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_text = candidate_text
+
+            accepted = False
+            reject_reason = ""
+            if NormalizeComparableText(best_text) == NormalizeComparableText(old_text):
+                reject_reason = "no_text_change"
+            elif best_score < old_score + self.config.reasr_min_improvement:
+                reject_reason = "insufficient_improvement"
+            else:
+                accepted = True
+
+            if accepted:
+                logging.info(
+                    "Targeted re-ASR accepted seg %d: %.1f -> %.1f",
+                    segment.id,
+                    old_score,
+                    best_score,
+                )
+                segment.text = best_text
+                improved += 1
+
+            report_segments.append(
+                {
+                    "segment_id": segment.id,
+                    "start": round(segment.start, 3),
+                    "end": round(segment.end, 3),
+                    "window_start": round(window_start, 3),
+                    "window_end": round(window_end, 3),
+                    "old_text": old_text,
+                    "old_score": old_score,
+                    "best_text": best_text,
+                    "best_score": best_score,
+                    "accepted": accepted,
+                    "reject_reason": reject_reason,
+                    "stop_reason": stop_reason,
+                    "attempts": attempts_log,
+                }
+            )
+
+        self.reasr_report["summary"]["improved_count"] = improved
+        self.reasr_report["summary"]["attempted_count"] = attempted
+        self.reasr_report["segments"] = report_segments
+
+        logging.info(
+            "Targeted re-ASR done: improved %d/%d low-score segments",
+            improved,
+            len(low_candidates),
+        )
 
     def semantic_reorganize(self, raw_segments: list[Segment]) -> list[Segment]:
         """Pass-1: build subtitle-ready Japanese segments with rule-first refinement."""
@@ -1098,6 +1295,79 @@ def BuildPass2SchemaText() -> str:
         },
     }
     return json.dumps(schema, ensure_ascii=False)
+
+
+def NormalizeComparableText(text: str) -> str:
+    """Normalize transcript text for stable equality checks."""
+    compact = re.sub(r"\s+", "", str(text or "").strip())
+    compact = compact.replace("。", ".").replace("，", ",")
+    compact = compact.replace("！", "!").replace("？", "?")
+    return compact
+
+
+def MergeAsrTexts(items: list[dict[str, Any]]) -> str:
+    """Join ASR item texts into one comparable sentence."""
+    if not items:
+        return ""
+    texts = [str(item.get("text") or "").strip() for item in items if str(item.get("text") or "").strip()]
+    if not texts:
+        return ""
+    return re.sub(r"\s+", " ", " ".join(texts)).strip()
+
+
+def EstimateAsrSegmentScore(
+    text: str,
+    duration: float,
+    raw_item: dict[str, Any]|None = None,
+) -> float:
+    """Heuristic ASR quality score (0-100) for targeted re-listen selection."""
+    score = 75.0
+    normalized = str(text or "").strip()
+
+    if not normalized:
+        return 0.0
+
+    if len(normalized) <= 1:
+        score -= 20.0
+    elif len(normalized) <= 3:
+        score -= 8.0
+
+    punct_count = sum(1 for ch in normalized if ch in "、。，．！？?!…")
+    punct_ratio = punct_count / max(1, len(normalized))
+    if punct_ratio > 0.45:
+        score -= 12.0
+
+    if re.search(r"(.)\1{4,}", normalized):
+        score -= 18.0
+    if re.search(r"[?？!！]{2,}", normalized):
+        score -= 8.0
+
+    if duration > 4.5 and len(normalized) <= 2:
+        score -= 10.0
+
+    if isinstance(raw_item, dict):
+        avg_logprob = SafeFloat(raw_item.get("avg_logprob"))
+        no_speech_prob = SafeFloat(raw_item.get("no_speech_prob"))
+        compression_ratio = SafeFloat(raw_item.get("compression_ratio"))
+
+        if avg_logprob is not None:
+            if avg_logprob <= -1.2:
+                score -= 18.0
+            elif avg_logprob <= -0.8:
+                score -= 10.0
+            elif avg_logprob >= -0.35:
+                score += 4.0
+
+        if no_speech_prob is not None:
+            if no_speech_prob >= 0.6:
+                score -= 22.0
+            elif no_speech_prob >= 0.35:
+                score -= 10.0
+
+        if compression_ratio is not None and compression_ratio >= 2.4:
+            score -= 10.0
+
+    return max(0.0, min(100.0, round(score, 2)))
 
 
 def ValidatePass1Item(item: dict[str, Any], strict: bool = True) -> bool:
@@ -1826,6 +2096,43 @@ def BuildArgParser() -> argparse.ArgumentParser:
     parser.add_argument("--title", help="Override title metadata")
     parser.add_argument("--description", help="Override description metadata")
     parser.add_argument("--channel", help="Override channel metadata")
+    parser.add_argument(
+        "--targeted-reasr",
+        action=argparse.BooleanOptionalAction,
+        default=(os.getenv("TARGETED_REASR", "0") == "1"),
+        help="Enable targeted re-ASR for low-score raw segments (default: off)",
+    )
+    parser.add_argument(
+        "--reasr-score-threshold",
+        type=float,
+        default=float(os.getenv("REASR_SCORE_THRESHOLD", "60")),
+        help="Segments scoring below this threshold enter targeted re-ASR",
+    )
+    parser.add_argument(
+        "--reasr-max-segments",
+        type=int,
+        default=int(os.getenv("REASR_MAX_SEGMENTS", "8")),
+        help="Maximum low-score segments to re-listen",
+    )
+    parser.add_argument(
+        "--reasr-attempts",
+        type=int,
+        default=int(os.getenv("REASR_ATTEMPTS", "2")),
+        help="Maximum re-listen attempts per low-score segment",
+    )
+    parser.add_argument(
+        "--reasr-window-pad",
+        type=float,
+        default=float(os.getenv("REASR_WINDOW_PAD", "0.2")),
+        help="Seconds to pad around each low-score segment when re-listening",
+    )
+    parser.add_argument(
+        "--reasr-min-improvement",
+        type=float,
+        default=float(os.getenv("REASR_MIN_IMPROVEMENT", "8")),
+        help="Minimum score gain needed to accept a re-ASR replacement",
+    )
+
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     return parser
@@ -1925,6 +2232,12 @@ def BuildConfigFromArgs(args: argparse.Namespace) -> PipelineConfig:
         title_override=args.title,
         description_override=args.description,
         channel_override=args.channel,
+        enable_targeted_reasr=bool(args.targeted_reasr),
+        reasr_score_threshold=float(args.reasr_score_threshold),
+        reasr_max_segments=max(1, int(args.reasr_max_segments)),
+        reasr_attempts=max(1, int(args.reasr_attempts)),
+        reasr_window_pad=max(0.0, float(args.reasr_window_pad)),
+        reasr_min_improvement=max(0.0, float(args.reasr_min_improvement)),
     )
 
 

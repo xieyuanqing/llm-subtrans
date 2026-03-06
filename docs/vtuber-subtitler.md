@@ -70,10 +70,13 @@ Intermediates are written to `./workspace/vtuber_subtitler` by default:
 
 ## Notes
 
-- ASR provider is manual: choose `--asr-provider local` or `--asr-provider cloudflare`.
+- ASR provider is manual: you decide `--asr-provider local` or `--asr-provider cloudflare` when asking the assistant to run the job.
 - No automatic failover is performed between local and cloudflare in this mode.
 - Default LLM path should use your configured New API gateway with `deepseek-ai/DeepSeek-V3.2` unless you explicitly switch it.
 - Operationally, this is an assistant-run pipeline on the VPS, not an end-user self-serve CLI workflow.
+- Provider-specific defaults are intentionally different:
+  - `local`: larger chunks, higher-quality audio download, quality-first.
+  - `cloudflare`: smaller chunks, conservative limits, platform-stability-first.
 - Pass-1 expects JSON output with `source_ids`, `start`, `end`, `text`.
 - Pass-2 enforces id/length mapping to avoid subtitle desync.
 - Both passes include explicit JSON schema prompts and strict field validation (`--strict-json`, `--no-strict-json`).
