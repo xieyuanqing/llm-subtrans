@@ -12,6 +12,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any
+import re
 
 import requests
 
@@ -70,6 +71,7 @@ class PipelineConfig:
     max_chunk_mb: float = 5.0
     overlap_seconds: float = 0.5
     min_chunk_seconds: float = 90.0
+    download_audio_format: str = "ba"
     pass1_batch_size: int = 120
     pass2_batch_size: int = 24
     pass2_context_lines: int = 5
@@ -389,7 +391,7 @@ class VTuberSubtitler:
             "yt-dlp",
             "--no-playlist",
             "-f",
-            "ba",
+            self.config.download_audio_format,
             "-x",
             "--audio-format",
             "m4a",
@@ -592,9 +594,22 @@ class VTuberSubtitler:
         return global_segments
 
     def semantic_reorganize(self, raw_segments: list[Segment]) -> list[Segment]:
-        """Pass-1: merge fragmented ASR output into coherent Japanese sentences."""
-        merged: list[Segment] = []
+        """Pass-1: build subtitle-ready Japanese segments with rule-first refinement."""
         id_lookup = {segment.id: segment for segment in raw_segments}
+
+        merged = self.rule_based_initial_segments(raw_segments, id_lookup)
+        merged = self.refine_oversized_segments(merged, id_lookup)
+        merged = SplitOversizedMergedSegments(merged, id_lookup, max_duration=9.5, max_chars=48)
+        merged = NormalizeSegmentIds(merged)
+        return merged
+
+    def rule_based_initial_segments(
+        self,
+        raw_segments: list[Segment],
+        id_lookup: dict[int, Segment],
+    ) -> list[Segment]:
+        """Run the broad pass-1 merge, then immediately enforce rule-based limits."""
+        merged: list[Segment] = []
         next_id = 1
 
         for batch in ChunkList(raw_segments, self.config.pass1_batch_size):
@@ -611,21 +626,20 @@ class VTuberSubtitler:
 
             system_prompt = (
                 "You are a strict subtitle editor for Japanese speech transcription. "
-                "Your task is to merge fragmented ASR pieces into grammatical Japanese sentences "
-                "without changing factual meaning. Remove meaningless filler words only when safe. "
-                "Return JSON ONLY."
+                "Merge fragmented ASR pieces into grammatical Japanese sentences without changing factual meaning. "
+                "Return JSON only."
             )
             user_prompt = (
-                "Input JSON array (chronological ASR fragments):\n"
+                "Input JSON array:\n"
                 f"{json.dumps(payload, ensure_ascii=False)}\n\n"
-                "Required output JSON schema:\n"
+                "Output schema:\n"
                 f"{BuildPass1SchemaText()}\n\n"
-                "Hard rules:\n"
-                "1) Output must be a root JSON array or an object with top-level key 'items'.\n"
-                "2) Each item must contain source_ids and text.\n"
-                "3) source_ids must reference ONLY ids from this batch.\n"
-                "4) Keep chronological order.\n"
-                "5) Do not output markdown fences or explanations."
+                "Rules:\n"
+                "1) Keep chronological order.\n"
+                "2) source_ids must use only ids from this batch.\n"
+                "3) Split on topic shifts and comment-reading turns.\n"
+                "4) Prefer half-sentence units around 、 。 ？ ！.\n"
+                "5) Return JSON only."
             )
 
             response_json = self.llm_client.chat_json(
@@ -664,8 +678,105 @@ class VTuberSubtitler:
                 )
                 next_id += 1
 
-        merged.sort(key=lambda segment: (segment.start, segment.end, segment.id))
-        return merged
+        return SplitOversizedMergedSegments(merged, id_lookup, max_duration=9.5, max_chars=48)
+
+    def refine_oversized_segments(
+        self,
+        merged_segments: list[Segment],
+        id_lookup: dict[int, Segment],
+    ) -> list[Segment]:
+        """Re-run pass-1 only for oversized segments to save tokens."""
+        refined: list[Segment] = []
+        oversized = [
+            segment for segment in merged_segments
+            if IsOversizedSegment(segment, max_duration=10.5, max_chars=52)
+        ]
+        refined_map = self.reorganize_oversized_segments(oversized, id_lookup)
+
+        for segment in merged_segments:
+            replacement = refined_map.get(segment.id)
+            if replacement:
+                refined.extend(replacement)
+            else:
+                refined.append(segment)
+
+        return EnsureNonOverlappingSourceCoverage(refined, id_lookup)
+
+    def reorganize_oversized_segments(
+        self,
+        segments: list[Segment],
+        id_lookup: dict[int, Segment],
+    ) -> dict[int, list[Segment]]:
+        """Ask the model to split only the segments that still violate hard limits."""
+        if not segments:
+            return {}
+
+        refined_map: dict[int, list[Segment]] = {}
+        for segment in segments:
+            source_segments = [id_lookup[source_id] for source_id in segment.source_ids if source_id in id_lookup]
+            if len(source_segments) <= 1:
+                continue
+
+            payload = [
+                {
+                    "id": item.id,
+                    "start": item.start,
+                    "end": item.end,
+                    "text": item.text,
+                }
+                for item in source_segments
+            ]
+            duration = round(segment.end - segment.start, 3)
+            user_prompt = (
+                "Split this failed merged subtitle into shorter chronological items.\n"
+                f"Current failed line ({duration}s / {len(segment.text)} chars): {json.dumps(segment.to_dict(), ensure_ascii=False)}\n\n"
+                "Raw ASR fragments for this line only:\n"
+                f"{json.dumps(payload, ensure_ascii=False)}\n\n"
+                "Output schema:\n"
+                f"{BuildPass1SchemaText()}\n\n"
+                "Rules:\n"
+                "1) Return JSON only.\n"
+                "2) Keep chronological order.\n"
+                "3) source_ids must use only the raw ids shown above.\n"
+                "4) Each item must be <= 40 chars and <= 8 seconds when possible.\n"
+                "5) Split by half-sentence units around 、 。 ？ ！ and follow ASR boundaries.\n"
+                "6) Prefer more items over one long item."
+            )
+            response_json = self.llm_client.chat_json(
+                model=self.config.llm_model,
+                system_prompt="You split one oversized Japanese subtitle into shorter subtitle units. Return JSON only.",
+                user_prompt=user_prompt,
+                temperature=0.0,
+            )
+
+            parsed_items = NormalizeArrayPayload(response_json)
+            rebuilt: list[Segment] = []
+            valid_ids = [item.id for item in source_segments]
+            for item in parsed_items:
+                if not ValidatePass1Item(item, strict=self.config.strict_json):
+                    continue
+                source_ids = ParseSourceIds(item.get("source_ids"), valid_ids)
+                if not source_ids:
+                    continue
+                chunk = [id_lookup[source_id] for source_id in source_ids if source_id in id_lookup]
+                chunk.sort(key=lambda value: (value.start, value.end, value.id))
+                text = str(item.get("text") or "").strip()
+                if not text or not chunk:
+                    continue
+                rebuilt.append(
+                    Segment(
+                        id=segment.id,
+                        start=chunk[0].start,
+                        end=chunk[-1].end,
+                        text=text,
+                        source_ids=[value.id for value in chunk],
+                    )
+                )
+
+            if rebuilt:
+                refined_map[segment.id] = rebuilt
+
+        return refined_map
 
     def contextual_translate(
         self,
@@ -704,7 +815,7 @@ class VTuberSubtitler:
                 model=self.config.llm_model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                temperature=0.0,
+                temperature=0.7,
             )
 
             output_items = NormalizeArrayPayload(response_json)
@@ -712,6 +823,9 @@ class VTuberSubtitler:
             translated.extend(normalized)
 
         translated.sort(key=lambda segment: (segment.start, segment.end, segment.id))
+        translated = ResplitTranslatedSegments(translated, max_duration=8.5, max_chars=42)
+        translated = MergeAdjacentShortSegments(translated, max_duration=8.5, max_chars=42)
+        translated = NormalizeSegmentIds(translated)
         return translated
 
     def normalize_pass2_output(
@@ -826,10 +940,11 @@ def BuildPass2SystemPrompt(metadata: dict[str, Any], glossary_text: str, termino
     channel = str(metadata.get("channel") or "").strip()
 
     sections = [
-        "You are an expert JP->ZH subtitle translator for VTuber content.",
-        "Translate Japanese into natural Simplified Chinese.",
-        "Do not summarize, do not omit meaning, and keep line-level alignment by id.",
-        "Keep internet slang, game jargon, and VTuber catchphrases consistent.",
+        "You translate Japanese subtitles into Simplified Chinese.",
+        "Be faithful to the source text. Do not summarize, embellish, soften, roleplay, or add flavor not present in the original.",
+        "Keep line-level alignment by id and preserve the speaker's tone without over-acting.",
+        "Use clear, concise wording suitable for subtitles.",
+        "If a line looks like a live chat comment being read aloud, translate it literally and briefly.",
         f"Terminology lock mode: {terminology_lock}.",
     ]
 
@@ -931,6 +1046,393 @@ def ValidatePass2Item(item: dict[str, Any], strict: bool = True) -> bool:
         return False
 
     return True
+
+
+def NormalizeSegmentIds(segments: list[Segment]) -> list[Segment]:
+    """Sort segments and rewrite ids sequentially."""
+    ordered = sorted(segments, key=lambda segment: (segment.start, segment.end, segment.id))
+    for index, segment in enumerate(ordered, start=1):
+        segment.id = index
+    return ordered
+
+
+def IsOversizedSegment(segment: Segment, max_duration: float = 8.0, max_chars: int = 40) -> bool:
+    """Return True when a segment violates hard subtitle limits."""
+    duration = max(0.0, segment.end - segment.start)
+    return duration > max_duration or len(segment.text) > max_chars
+
+
+def EnsureNonOverlappingSourceCoverage(
+    segments: list[Segment],
+    id_lookup: dict[int, Segment],
+) -> list[Segment]:
+    """Prevent refined segments from reusing the same raw ASR ids."""
+    fixed: list[Segment] = []
+    used_source_ids: set[int] = set()
+
+    for segment in sorted(segments, key=lambda item: (item.start, item.end, item.id)):
+        unique_ids = [source_id for source_id in segment.source_ids if source_id not in used_source_ids]
+        if not unique_ids:
+            continue
+        if len(unique_ids) != len(segment.source_ids):
+            source_segments = [id_lookup[source_id] for source_id in unique_ids if source_id in id_lookup]
+            if not source_segments:
+                continue
+            source_segments.sort(key=lambda item: (item.start, item.end, item.id))
+            segment = Segment(
+                id=segment.id,
+                start=source_segments[0].start,
+                end=source_segments[-1].end,
+                text=segment.text,
+                source_ids=unique_ids,
+            )
+        used_source_ids.update(unique_ids)
+        fixed.append(segment)
+
+    return fixed
+
+
+def SplitOversizedMergedSegments(
+    segments: list[Segment],
+    id_lookup: dict[int, Segment],
+    max_duration: float = 8.0,
+    max_chars: int = 40,
+) -> list[Segment]:
+    """Force-split oversized pass-1 segments using raw ASR boundaries."""
+    result: list[Segment] = []
+
+    for segment in segments:
+        duration = max(0.0, segment.end - segment.start)
+        if duration <= max_duration and len(segment.text) <= max_chars:
+            result.append(segment)
+            continue
+
+        source_segments = [id_lookup[source_id] for source_id in segment.source_ids if source_id in id_lookup]
+        if len(source_segments) <= 1:
+            result.append(segment)
+            continue
+
+        result.extend(SplitSegmentBySourceBoundaries(segment, source_segments, max_duration=max_duration, max_chars=max_chars))
+
+    return result
+
+
+def SplitSegmentBySourceBoundaries(
+    segment: Segment,
+    source_segments: list[Segment],
+    max_duration: float = 8.0,
+    max_chars: int = 40,
+) -> list[Segment]:
+    """Split a merged segment into smaller units aligned to original ASR fragments."""
+    clauses = SplitJapaneseClauses(segment.text)
+    groups = GroupSourceSegments(source_segments, len(clauses), max_duration=max_duration, max_chars=max_chars)
+    if len(groups) <= 1:
+        return [segment]
+
+    rebuilt: list[Segment] = []
+    clause_index = 0
+    for group in groups:
+        take = max(1, len(clauses) - clause_index - (len(groups) - len(rebuilt) - 1))
+        share = len(group)
+        chunk_clauses = clauses[clause_index:clause_index + max(1, min(share, len(clauses) - clause_index))]
+        clause_index += len(chunk_clauses)
+        text = "".join(chunk_clauses).strip()
+        if not text:
+            text = " ".join(item.text.strip() for item in group if item.text.strip()).strip() or segment.text.strip()
+        rebuilt.append(
+            Segment(
+                id=segment.id,
+                start=group[0].start,
+                end=group[-1].end,
+                text=text,
+                source_ids=[item.id for item in group],
+            )
+        )
+
+    if clause_index < len(clauses) and rebuilt:
+        rebuilt[-1].text = (rebuilt[-1].text + "".join(clauses[clause_index:])).strip()
+
+    return rebuilt or [segment]
+
+
+def SplitJapaneseClauses(text: str) -> list[str]:
+    """Split Japanese text into clause-like units while keeping punctuation attached."""
+    normalized = text.strip()
+    if not normalized:
+        return []
+
+    parts = [piece.strip() for piece in re.split(r"(?<=[、。？！?])", normalized) if piece.strip()]
+    if not parts:
+        return [normalized]
+
+    merged: list[str] = []
+    buffer = ""
+    for part in parts:
+        if len(buffer) + len(part) <= 18:
+            buffer += part
+            continue
+        if buffer:
+            merged.append(buffer)
+        buffer = part
+    if buffer:
+        merged.append(buffer)
+    return merged or [normalized]
+
+
+def GroupSourceSegments(
+    source_segments: list[Segment],
+    clause_count: int,
+    max_duration: float = 8.0,
+    max_chars: int = 40,
+) -> list[list[Segment]]:
+    """Group raw ASR segments into shorter chronological chunks."""
+    if not source_segments:
+        return []
+
+    target_groups = max(1, clause_count)
+    groups: list[list[Segment]] = []
+    current: list[Segment] = []
+
+    for index, item in enumerate(source_segments):
+        candidate = current + [item]
+        candidate_duration = candidate[-1].end - candidate[0].start
+        candidate_chars = sum(len(part.text.strip()) for part in candidate)
+        remaining_items = len(source_segments) - index - 1
+        remaining_groups = max(0, target_groups - len(groups) - 1)
+
+        overflow = candidate_duration > max_duration or candidate_chars > max_chars
+        if current and overflow and remaining_items >= remaining_groups:
+            groups.append(current)
+            current = [item]
+        else:
+            current = candidate
+
+    if current:
+        groups.append(current)
+
+    return groups or [source_segments]
+
+
+def MergeAdjacentShortSegments(
+    segments: list[Segment],
+    max_duration: float = 8.5,
+    max_chars: int = 42,
+) -> list[Segment]:
+    """Merge nearby short subtitle lines only when they read as one thought."""
+    ordered = sorted(segments, key=lambda segment: (segment.start, segment.end, segment.id))
+    if not ordered:
+        return []
+
+    merged: list[Segment] = [ordered[0]]
+    merge_counts: list[int] = [0]
+    for current in ordered[1:]:
+        previous = merged[-1]
+        previous_duration = previous.end - previous.start
+        current_duration = current.end - current.start
+        gap = current.start - previous.end
+        combined_text = JoinSubtitleTexts(previous.text, current.text)
+        combined_duration = current.end - previous.start
+        should_merge = (
+            gap <= 0.36
+            and (previous_duration <= 2.3 or current_duration <= 2.3)
+            and len(combined_text) <= max_chars
+            and combined_duration <= max_duration
+            and ShouldMergeSubtitleTexts(
+                previous.text,
+                current.text,
+                gap=gap,
+                merge_count=merge_counts[-1],
+                previous_duration=previous_duration,
+                current_duration=current_duration,
+            )
+        )
+        if should_merge:
+            merged[-1] = Segment(
+                id=previous.id,
+                start=previous.start,
+                end=current.end,
+                text=combined_text,
+                source_ids=list(dict.fromkeys(previous.source_ids + current.source_ids)),
+            )
+            merge_counts[-1] += 1
+        else:
+            merged.append(current)
+            merge_counts.append(0)
+
+    return merged
+
+
+def JoinSubtitleTexts(left: str, right: str) -> str:
+    """Join two subtitle texts with natural Chinese spacing rules."""
+    left = left.strip()
+    right = right.strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if left[-1] in "，。、？！?!…~" or right[0] in "，。、？！?!…~":
+        return f"{left}{right}"
+    return f"{left} {right}"
+
+
+def ShouldMergeSubtitleTexts(
+    left: str,
+    right: str,
+    gap: float,
+    merge_count: int = 0,
+    previous_duration: float = 0.0,
+    current_duration: float = 0.0,
+) -> bool:
+    """Return True only when adjacent short texts feel like one continued thought."""
+    left = left.strip()
+    right = right.strip()
+    if not left or not right:
+        return False
+    if merge_count >= 1:
+        return False
+
+    hard_stop_punct = ("。", "！", "!", "？", "?", "...", "…", "~")
+    strong_hard_stop = ("？", "?", "！", "!")
+    soft_continue_punct = ("，", "、", "——", "—", "-")
+    emotional_endings = ("啊", "呢", "吧", "哦", "哇", "嘛", "草", "w")
+    continuation_starts = ("而", "但", "然后", "所以", "于是", "因为", "就是", "那个", "还", "就", "也", "又")
+
+    ultra_short = (len(left) <= 4 or len(right) <= 4 or previous_duration <= 1.2 or current_duration <= 1.2)
+
+    if left.endswith(strong_hard_stop):
+        return False
+    if left.endswith(hard_stop_punct):
+        if not ultra_short:
+            return False
+        if gap > 0.12:
+            return False
+
+    if gap >= 0.24:
+        return False
+    if any(left.endswith(ending) for ending in emotional_endings) and gap >= 0.18:
+        return False
+
+    if right.startswith(continuation_starts):
+        return True
+    if left.endswith(soft_continue_punct):
+        return True
+    if ultra_short and gap <= 0.2:
+        return True
+    if not left.endswith(("。", "？", "?", "！", "!")):
+        return True
+    return False
+
+
+def ResplitTranslatedSegments(
+    segments: list[Segment],
+    max_duration: float = 8.0,
+    max_chars: int = 40,
+) -> list[Segment]:
+    """A final target-language pass to shorten subtitles after translation."""
+    result: list[Segment] = []
+    for segment in segments:
+        duration = max(0.0, segment.end - segment.start)
+        if not IsOversizedSegment(segment, max_duration=max_duration, max_chars=max_chars):
+            result.append(segment)
+            continue
+        if duration <= 4.0 or len(segment.text.strip()) <= 18:
+            result.append(segment)
+            continue
+
+        parts = SplitChineseSubtitleClauses(segment.text)
+        if len(parts) <= 1:
+            result.append(segment)
+            continue
+
+        slices = AllocateTextSlices(segment.start, segment.end, parts)
+        for start, end, text in slices:
+            result.append(
+                Segment(
+                    id=segment.id,
+                    start=start,
+                    end=end,
+                    text=text,
+                    source_ids=list(segment.source_ids),
+                )
+            )
+
+    return result
+
+
+def SplitChineseSubtitleClauses(text: str) -> list[str]:
+    """Split translated text into shorter subtitle clauses."""
+    normalized = text.strip()
+    if not normalized:
+        return []
+    parts = [piece.strip() for piece in re.split(r"(?<=[，。？！?])", normalized) if piece.strip()]
+    if not parts:
+        return [normalized]
+
+    result: list[str] = []
+    buffer = ""
+    for part in parts:
+        if buffer and len(buffer) + len(part) > 26:
+            result.append(buffer)
+            buffer = part
+        else:
+            buffer += part
+    if buffer:
+        result.append(buffer)
+    return result or [normalized]
+
+
+def AllocateTextSlices(start: float, end: float, parts: list[str]) -> list[tuple[float, float, str]]:
+    """Distribute a segment duration across split text parts by character weight."""
+    duration = max(0.001, end - start)
+    weights = [max(1, len(part)) for part in parts]
+    total = sum(weights)
+    cursor = start
+    slices: list[tuple[float, float, str]] = []
+    for index, part in enumerate(parts):
+        if index == len(parts) - 1:
+            part_end = end
+        else:
+            part_end = round(cursor + duration * (weights[index] / total), 3)
+        slices.append((round(cursor, 3), round(max(part_end, cursor + 0.001), 3), part))
+        cursor = part_end
+    return slices
+
+
+def ApplySubtitleBreathingRoom(
+    segments: list[Segment],
+    lead_in: float = 0.08,
+    lead_out: float = 0.10,
+) -> list[Segment]:
+    """Add tiny visual padding to subtitle timings without creating overlaps."""
+    ordered = sorted(segments, key=lambda segment: (segment.start, segment.end, segment.id))
+    if not ordered:
+        return []
+
+    padded: list[Segment] = []
+    for index, segment in enumerate(ordered):
+        prev_end = ordered[index - 1].end if index > 0 else 0.0
+        next_start = ordered[index + 1].start if index + 1 < len(ordered) else None
+
+        start = max(0.0, segment.start - lead_in)
+        end = segment.end + lead_out
+
+        if index > 0:
+            start = max(start, prev_end + 0.001)
+        if next_start is not None:
+            end = min(end, next_start - 0.001)
+        end = max(end, start + 0.12)
+
+        padded.append(
+            Segment(
+                id=segment.id,
+                start=round(start, 3),
+                end=round(end, 3),
+                text=segment.text,
+                source_ids=list(segment.source_ids),
+            )
+        )
+
+    return padded
 
 
 def ParseGlossaryPairs(glossary_text: str) -> list[tuple[str, str]]:
@@ -1097,7 +1599,8 @@ def FormatSrtTimestamp(seconds: float) -> str:
 def BuildSrtText(segments: list[Segment]) -> str:
     """Render subtitle segments to SRT text."""
     lines: list[str] = []
-    for index, segment in enumerate(sorted(segments, key=lambda s: (s.start, s.end, s.id)), start=1):
+    padded_segments = ApplySubtitleBreathingRoom(segments)
+    for index, segment in enumerate(sorted(padded_segments, key=lambda s: (s.start, s.end, s.id)), start=1):
         lines.append(str(index))
         lines.append(f"{FormatSrtTimestamp(segment.start)} --> {FormatSrtTimestamp(segment.end)}")
         lines.append(segment.text.strip())
@@ -1173,9 +1676,10 @@ def BuildArgParser() -> argparse.ArgumentParser:
         help="LLM model for pass-1/pass-2. Default matches your stable New API DeepSeek V3.2 setup.",
     )
 
-    parser.add_argument("--max-chunk-mb", type=float, default=5.0)
-    parser.add_argument("--overlap-seconds", type=float, default=0.5)
-    parser.add_argument("--min-chunk-seconds", type=float, default=90.0)
+    parser.add_argument("--max-chunk-mb", type=float, default=None, help="Override provider-specific max chunk size in MB")
+    parser.add_argument("--overlap-seconds", type=float, default=None, help="Override provider-specific chunk overlap in seconds")
+    parser.add_argument("--min-chunk-seconds", type=float, default=None, help="Override provider-specific minimum chunk seconds")
+    parser.add_argument("--download-audio-format", default=None, help="Override yt-dlp audio format selector")
     parser.add_argument("--pass1-batch-size", type=int, default=120)
     parser.add_argument("--pass2-batch-size", type=int, default=24)
     parser.add_argument("--pass2-context-lines", type=int, default=5)
@@ -1204,6 +1708,27 @@ def BuildArgParser() -> argparse.ArgumentParser:
     return parser
 
 
+def ResolveProviderDefaults(provider: str) -> dict[str, Any]:
+    """Return provider-specific operational defaults."""
+    if provider == "local":
+        return {
+            "max_chunk_mb": 48.0,
+            "overlap_seconds": 1.0,
+            "min_chunk_seconds": 480.0,
+            "download_audio_format": "bestaudio[abr>96]/bestaudio",
+        }
+
+    if provider == "cloudflare":
+        return {
+            "max_chunk_mb": 4.5,
+            "overlap_seconds": 0.5,
+            "min_chunk_seconds": 90.0,
+            "download_audio_format": "bestaudio[abr>64]/bestaudio",
+        }
+
+    raise VTuberSubtitlerError(f"Unsupported ASR provider: {provider}")
+
+
 def BuildConfigFromArgs(args: argparse.Namespace) -> PipelineConfig:
     """Create PipelineConfig from parsed args."""
     llm_key = str(args.llm_api_key or "").strip()
@@ -1211,6 +1736,8 @@ def BuildConfigFromArgs(args: argparse.Namespace) -> PipelineConfig:
         raise VTuberSubtitlerError("LLM API key is required (--llm-api-key or LLM_API_KEY/NEWAPI_API_KEY/DEEPSEEK_API_KEY)")
 
     provider = str(args.asr_provider or "local").strip().lower()
+
+    provider_defaults = ResolveProviderDefaults(provider)
 
     if provider == "local":
         local_base = str(args.local_asr_api_base or args.asr_api_base or "").strip()
@@ -1259,9 +1786,10 @@ def BuildConfigFromArgs(args: argparse.Namespace) -> PipelineConfig:
         llm_api_base=str(args.llm_api_base),
         llm_api_key=llm_key,
         llm_model=str(args.llm_model),
-        max_chunk_mb=float(args.max_chunk_mb),
-        overlap_seconds=float(args.overlap_seconds),
-        min_chunk_seconds=float(args.min_chunk_seconds),
+        max_chunk_mb=float(args.max_chunk_mb if args.max_chunk_mb is not None else provider_defaults["max_chunk_mb"]),
+        overlap_seconds=float(args.overlap_seconds if args.overlap_seconds is not None else provider_defaults["overlap_seconds"]),
+        min_chunk_seconds=float(args.min_chunk_seconds if args.min_chunk_seconds is not None else provider_defaults["min_chunk_seconds"]),
+        download_audio_format=str(args.download_audio_format or provider_defaults["download_audio_format"]),
         pass1_batch_size=int(args.pass1_batch_size),
         pass2_batch_size=int(args.pass2_batch_size),
         pass2_context_lines=int(args.pass2_context_lines),
