@@ -1,4 +1,48 @@
-# LLM-Subtrans
+# LLM-Subtrans（默认中文）
+
+LLM-Subtrans 是一个开源字幕翻译工具，使用大语言模型（LLM）作为翻译服务，可以在模型支持的语言对之间进行字幕翻译。
+
+## 中文快速说明
+
+- **支持格式**：`.srt`、`.ssa/.ass`、`.vtt`
+- **使用方式**：支持 GUI 与命令行
+- **常见安装方式**：
+  - 普通用户：直接下载 Releases 打包版本使用
+  - 开发者/命令行用户：按“Installing from source”从源码安装
+- **注意事项**：需要联网；字幕内容会发送到所选翻译服务商，需遵循其隐私政策
+
+### 快速开始（命令行示例）
+
+```sh
+# OpenRouter 自动选模型
+llm-subtrans --auto -l <目标语言> <字幕文件路径>
+
+# 指定模型
+llm-subtrans --model google/gemini-2.5-flash -l <目标语言> <字幕文件路径>
+
+# 翻译并转换格式（ASS -> SRT）
+llm-subtrans -l <目标语言> -o output.srt input.ass
+```
+
+### VTuber 两阶段流程（实验）
+
+```sh
+# 本地 Whisper（优先）
+python scripts/vtuber_subtitler.py "https://www.youtube.com/watch?v=<VIDEO_ID>" \
+  --output ./output/demo.zh.srt \
+  --asr-provider local \
+  --local-asr-api-base "http://100.74.157.37:8000/v1" \
+  --local-asr-api-key "$LOCAL_ASR_API_KEY" \
+  --llm-api-base http://localhost:3000/v1 \
+  --llm-api-key "$NEWAPI_API_KEY" \
+  --llm-model deepseek-ai/DeepSeek-V3.2 \
+  --terminology-lock warn \
+  --strict-json
+```
+
+---
+
+## English Backup (Original)
 LLM-Subtrans is an open source subtitle translator that uses LLMs as a translation service. It can translate subtitles between any language pairs supported by the language model.
 
 The application supports multiple subtitle formats through a pluggable system. Currently `.srt`, `.ssa`/`.ass` and `.vtt` files are supported.
@@ -209,6 +253,9 @@ llm-subtrans --list-formats
 python scripts/batch_translate.py ./subtitles ./translated --provider openai --model gpt-5-mini --apikey sk-... --language Spanish
 
 # Experimental VTuber pipeline (assistant-run on VPS)
+# Provider defaults intentionally differ:
+# - local: quality-first, larger chunks, higher-quality audio
+# - cloudflare: conservative chunk sizing for Workers stability
 # A) local whisper (preferred)
 python scripts/vtuber_subtitler.py "https://www.youtube.com/watch?v=<VIDEO_ID>" \
   --output ./output/demo.zh.srt \
